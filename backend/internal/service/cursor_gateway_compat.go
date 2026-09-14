@@ -42,7 +42,7 @@ func (s *CursorGatewayService) ForwardAsAnthropic(
 	}
 
 	mappedModel := account.GetMappedModel(req.Model)
-	agentReq := cursor.AgentRunRequest{Model: mappedModel, Messages: cursorMessagesFromChat(ccReq.Messages)}
+	agentReq := buildCursorAgentRunRequest(mappedModel, ccReq.Messages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
 	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, cursorRunOptsFromAnthropic(&req))
 	if err != nil {
 		return nil, err
@@ -82,7 +82,7 @@ func (s *CursorGatewayService) ForwardAsResponses(
 	}
 
 	mappedModel := account.GetMappedModel(req.Model)
-	agentReq := cursor.AgentRunRequest{Model: mappedModel, Messages: cursorMessagesFromChat(ccReq.Messages)}
+	agentReq := buildCursorAgentRunRequest(mappedModel, ccReq.Messages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
 	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, cursorRunOptsFromResponses(&req))
 	if err != nil {
 		return nil, err
@@ -93,17 +93,6 @@ func (s *CursorGatewayService) ForwardAsResponses(
 		return s.streamCursorAsResponses(c, resp.Body, req.Model, warnings, startTime)
 	}
 	return s.nonStreamCursorAsResponses(c, resp.Body, req.Model, warnings, startTime)
-}
-
-func cursorMessagesFromChat(messages []apicompat.ChatMessage) []cursor.ChatMessage {
-	out := make([]cursor.ChatMessage, 0, len(messages))
-	for _, message := range messages {
-		out = append(out, cursor.ChatMessage{
-			Role:    message.Role,
-			Content: chatRawContentText(message.Content),
-		})
-	}
-	return out
 }
 
 func chatRawContentText(raw json.RawMessage) string {
@@ -133,49 +122,80 @@ func chatRawContentText(raw json.RawMessage) string {
 	return string(raw)
 }
 
-func collectCursorAssistant(body io.Reader) (text, thinking, connectErr string, usage cursor.TokenUsage) {
+func collectCursorAssistant(body io.Reader) (text, thinking, connectErr string, usage cursor.TokenUsage, toolCalls []apicompat.ChatToolCall) {
 	var textBuf, thinkingBuf strings.Builder
-	usage, connectErr = iterCursorAssistant(body, func(kind, payload string) error {
-		switch kind {
-		case "text":
-			textBuf.WriteString(payload)
-		case "thinking":
-			thinkingBuf.WriteString(payload)
-		}
-		return nil
-	})
-	return textBuf.String(), thinkingBuf.String(), connectErr, usage
-}
-
-func iterCursorAssistant(body io.Reader, emit func(kind, text string) error) (usage cursor.TokenUsage, connectErr string) {
-	return cursor.ConsumeAssistantStream(body, func(ev cursor.StreamEvent) error {
+	usage, connectErr = cursor.ConsumeAssistantStream(body, func(ev cursor.StreamEvent) error {
 		switch ev.Type {
-		case "text", "thinking":
-			if err := emit(ev.Type, ev.Text); err != nil {
-				return err
+		case "text":
+			textBuf.WriteString(ev.Text)
+		case "thinking":
+			thinkingBuf.WriteString(ev.Text)
+		case "tool_call":
+			if ev.ToolCall != nil {
+				toolCalls = append(toolCalls, apicompat.ChatToolCall{
+					ID:   ev.ToolCall.ID,
+					Type: "function",
+					Function: apicompat.ChatFunctionCall{
+						Name:      ev.ToolCall.Name,
+						Arguments: ev.ToolCall.RawArgs,
+					},
+				})
 			}
 		}
 		return nil
 	})
+	return textBuf.String(), thinkingBuf.String(), connectErr, usage, toolCalls
 }
 
-func cursorChatCompletion(id, model, text, thinking string, usage cursor.TokenUsage) *apicompat.ChatCompletionsResponse {
+func cursorChatCompletion(id, model, text, thinking string, usage cursor.TokenUsage, toolCalls []apicompat.ChatToolCall) *apicompat.ChatCompletionsResponse {
 	content, _ := json.Marshal(text)
+	message := apicompat.ChatMessage{
+		Role:             "assistant",
+		Content:          content,
+		ReasoningContent: thinking,
+	}
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		message.ToolCalls = toolCalls
+		finishReason = "tool_calls"
+	}
 	return &apicompat.ChatCompletionsResponse{
 		ID:      id,
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   model,
 		Choices: []apicompat.ChatChoice{{
-			Index: 0,
-			Message: apicompat.ChatMessage{
-				Role:             "assistant",
-				Content:          content,
-				ReasoningContent: thinking,
-			},
-			FinishReason: "stop",
+			Index:        0,
+			Message:      message,
+			FinishReason: finishReason,
 		}},
 		Usage: chatUsageFromCursor(usage),
+	}
+}
+
+// cursorToolCallChunk wraps one caller-executed tool call in the chunk shape
+// the anthropic/responses bridges translate into tool_use blocks and
+// function_call items.
+func cursorToolCallChunk(id, model string, call cursor.ToolCallEvent, index int) *apicompat.ChatCompletionsChunk {
+	return &apicompat.ChatCompletionsChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []apicompat.ChatChunkChoice{{
+			Index: 0,
+			Delta: apicompat.ChatDelta{
+				ToolCalls: []apicompat.ChatToolCall{{
+					Index: &index,
+					ID:    call.ID,
+					Type:  "function",
+					Function: apicompat.ChatFunctionCall{
+						Name:      call.Name,
+						Arguments: call.RawArgs,
+					},
+				}},
+			},
+		}},
 	}
 }
 
@@ -218,13 +238,13 @@ func (s *CursorGatewayService) nonStreamCursorAsAnthropic(
 	warnings []map[string]string,
 	startTime time.Time,
 ) (*ForwardResult, error) {
-	text, thinking, connectErr, usage := collectCursorAssistant(body)
-	if connectErr != "" && text == "" {
+	text, thinking, connectErr, usage, toolCalls := collectCursorAssistant(body)
+	if connectErr != "" && text == "" && len(toolCalls) == 0 {
 		status, errType, message := classifyCursorConnectError(connectErr)
 		writeAnthropicError(c, status, errType, message)
 		return nil, fmt.Errorf("cursor anthropic: %s", message)
 	}
-	ccResp := cursorChatCompletion("chatcmpl-cursor-"+time.Now().Format("20060102150405"), model, text, thinking, usage)
+	ccResp := cursorChatCompletion("chatcmpl-cursor-"+time.Now().Format("20060102150405"), model, text, thinking, usage, toolCalls)
 	c.JSON(http.StatusOK, apicompat.ChatCompletionsResponseToAnthropic(ccResp, model))
 	return cursorForwardResult(model, false, startTime, nil, usage), nil
 }
@@ -255,16 +275,30 @@ func (s *CursorGatewayService) streamCursorAsAnthropic(
 		c.Writer.Flush()
 	}
 
-	usage, connectErr := iterCursorAssistant(body, func(kind, payload string) error {
+	toolCallIndex := 0
+	usage, connectErr := cursor.ConsumeAssistantStream(body, func(ev cursor.StreamEvent) error {
+		switch ev.Type {
+		case "text", "thinking", "tool_call":
+		default:
+			return nil
+		}
 		if firstTokenMs == nil {
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
 		}
 		text, thinking := "", ""
-		if kind == "thinking" {
-			thinking = payload
-		} else {
-			text = payload
+		switch ev.Type {
+		case "thinking":
+			thinking = ev.Text
+		case "tool_call":
+			if ev.ToolCall != nil {
+				writeEvents(apicompat.ChatCompletionsChunkToAnthropicEvents(
+					cursorToolCallChunk(completionID, model, *ev.ToolCall, toolCallIndex), state))
+				toolCallIndex++
+			}
+			return nil
+		default:
+			text = ev.Text
 		}
 		writeEvents(apicompat.ChatCompletionsChunkToAnthropicEvents(cursorTextChunk(completionID, model, text, thinking), state))
 		return nil
@@ -291,13 +325,13 @@ func (s *CursorGatewayService) nonStreamCursorAsResponses(
 	warnings []map[string]string,
 	startTime time.Time,
 ) (*ForwardResult, error) {
-	text, thinking, connectErr, usage := collectCursorAssistant(body)
-	if connectErr != "" && text == "" {
+	text, thinking, connectErr, usage, toolCalls := collectCursorAssistant(body)
+	if connectErr != "" && text == "" && len(toolCalls) == 0 {
 		status, errType, message := classifyCursorConnectError(connectErr)
 		writeResponsesError(c, status, errType, message)
 		return nil, fmt.Errorf("cursor responses: %s", message)
 	}
-	ccResp := cursorChatCompletion("chatcmpl-cursor-"+time.Now().Format("20060102150405"), model, text, thinking, usage)
+	ccResp := cursorChatCompletion("chatcmpl-cursor-"+time.Now().Format("20060102150405"), model, text, thinking, usage, toolCalls)
 	c.JSON(http.StatusOK, apicompat.ChatCompletionsResponseToResponses(ccResp, model, nil, nil, false, nil))
 	return cursorForwardResult(model, false, startTime, nil, usage), nil
 }
@@ -328,16 +362,30 @@ func (s *CursorGatewayService) streamCursorAsResponses(
 		c.Writer.Flush()
 	}
 
-	usage, connectErr := iterCursorAssistant(body, func(kind, payload string) error {
+	toolCallIndex := 0
+	usage, connectErr := cursor.ConsumeAssistantStream(body, func(ev cursor.StreamEvent) error {
+		switch ev.Type {
+		case "text", "thinking", "tool_call":
+		default:
+			return nil
+		}
 		if firstTokenMs == nil {
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
 		}
 		text, thinking := "", ""
-		if kind == "thinking" {
-			thinking = payload
-		} else {
-			text = payload
+		switch ev.Type {
+		case "thinking":
+			thinking = ev.Text
+		case "tool_call":
+			if ev.ToolCall != nil {
+				writeEvents(apicompat.ChatCompletionsChunkToResponsesEvents(
+					cursorToolCallChunk(completionID, model, *ev.ToolCall, toolCallIndex), state))
+				toolCallIndex++
+			}
+			return nil
+		default:
+			text = ev.Text
 		}
 		writeEvents(apicompat.ChatCompletionsChunkToResponsesEvents(cursorTextChunk(completionID, model, text, thinking), state))
 		return nil

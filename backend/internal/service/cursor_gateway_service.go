@@ -70,6 +70,8 @@ func (s *CursorGatewayService) ForwardAsChatCompletions(
 		StreamOptions *struct {
 			IncludeUsage bool `json:"include_usage"`
 		} `json:"stream_options,omitempty"`
+		Tools      []apicompat.ChatTool `json:"tools"`
+		ToolChoice json.RawMessage      `json:"tool_choice"`
 	}
 	if err := json.Unmarshal(body, &ccReq); err != nil {
 		return nil, s.writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
@@ -78,25 +80,18 @@ func (s *CursorGatewayService) ForwardAsChatCompletions(
 		return nil, s.writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 	}
 
-	// Parse messages into cursor format. Content may be a plain string or an
-	// OpenAI content-parts array; both collapse to text.
-	var openAIMessages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}
+	// Messages parse into the shared apicompat shape: content may be a plain
+	// string or a content-parts array, and assistant tool_calls plus role:tool
+	// results are preserved for Agent-mode replay.
+	var openAIMessages []apicompat.ChatMessage
 	if err := json.Unmarshal(ccReq.Messages, &openAIMessages); err != nil {
 		return nil, s.writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse messages")
 	}
 
-	cursorMessages := make([]cursor.ChatMessage, len(openAIMessages))
-	for i, m := range openAIMessages {
-		cursorMessages[i] = cursor.ChatMessage{Role: m.Role, Content: chatRawContentText(m.Content)}
-	}
-
 	mappedModel := account.GetMappedModel(ccReq.Model)
 	opts := cursorRunOpts(ccReq.ReasoningEffort, ccReq.Reasoning, ccReq.Fast, ccReq.Thinking)
-	agentReq := cursor.AgentRunRequest{Model: mappedModel, Messages: cursorMessages}
-	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, opts)
+	req := buildCursorAgentRunRequest(mappedModel, openAIMessages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
+	resp, _, warnings, err := s.startCursorChat(ctx, c, account, req, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -425,17 +420,24 @@ func (s *CursorGatewayService) streamResponse(
 	}
 
 	var firstTokenMs *int
+	toolCallCount := 0
 	completionID := "chatcmpl-cursor-" + time.Now().Format("20060102150405")
 
 	usage, connectErr := cursor.ConsumeAssistantStream(body, func(ev cursor.StreamEvent) error {
 		switch ev.Type {
-		case "text", "thinking":
+		case "text", "thinking", "tool_call":
 		default:
 			return nil
 		}
 		if firstTokenMs == nil {
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
+		}
+		if ev.Type == "tool_call" && ev.ToolCall != nil {
+			fmt.Fprintf(c.Writer, "data: %s\n\n", buildCursorToolCallChunk(completionID, model, *ev.ToolCall, toolCallCount))
+			toolCallCount++
+			c.Writer.Flush()
+			return nil
 		}
 		content, reasoning := "", ""
 		if ev.Type == "thinking" {
@@ -461,7 +463,11 @@ func (s *CursorGatewayService) streamResponse(
 		fmt.Fprintf(c.Writer, "data: %s\n\n", errChunk)
 		c.Writer.Flush()
 	} else {
-		fmt.Fprintf(c.Writer, "data: %s\n\n", buildCursorSSEChunk(completionID, model, "", "", "stop"))
+		finishReason := "stop"
+		if toolCallCount > 0 {
+			finishReason = "tool_calls"
+		}
+		fmt.Fprintf(c.Writer, "data: %s\n\n", buildCursorSSEChunk(completionID, model, "", "", finishReason))
 		c.Writer.Flush()
 		if includeUsage {
 			if chatUsage := chatUsageFromCursor(usage); chatUsage != nil {
@@ -485,17 +491,29 @@ func (s *CursorGatewayService) nonStreamResponse(
 	startTime time.Time,
 ) (*ForwardResult, error) {
 	var totalText, thinking strings.Builder
+	var toolCalls []apicompat.ChatToolCall
 	usage, connectErr := cursor.ConsumeAssistantStream(body, func(ev cursor.StreamEvent) error {
 		switch ev.Type {
 		case "text":
 			totalText.WriteString(ev.Text)
 		case "thinking":
 			thinking.WriteString(ev.Text)
+		case "tool_call":
+			if ev.ToolCall != nil {
+				toolCalls = append(toolCalls, apicompat.ChatToolCall{
+					ID:   ev.ToolCall.ID,
+					Type: "function",
+					Function: apicompat.ChatFunctionCall{
+						Name:      ev.ToolCall.Name,
+						Arguments: ev.ToolCall.RawArgs,
+					},
+				})
+			}
 		}
 		return nil
 	})
 
-	if connectErr != "" && totalText.Len() == 0 && thinking.Len() == 0 {
+	if connectErr != "" && totalText.Len() == 0 && thinking.Len() == 0 && len(toolCalls) == 0 {
 		status, errType, message := classifyCursorConnectError(connectErr)
 		return nil, s.writeChatCompletionsError(c, status, errType, message)
 	}
@@ -506,6 +524,14 @@ func (s *CursorGatewayService) nonStreamResponse(
 	}
 	if thinking.Len() > 0 {
 		message["reasoning_content"] = thinking.String()
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+	}
+
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
 	}
 
 	completionID := "chatcmpl-cursor-" + time.Now().Format("20060102150405")
@@ -518,7 +544,7 @@ func (s *CursorGatewayService) nonStreamResponse(
 			{
 				"index":         0,
 				"message":       message,
-				"finish_reason": "stop",
+				"finish_reason": finishReason,
 			},
 		},
 	}
@@ -606,6 +632,38 @@ func buildCursorSSEChunk(id, model, content, reasoning, finishReason string) str
 		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": []map[string]any{choice},
+	}
+	data, _ := json.Marshal(chunk)
+	return string(data)
+}
+
+// buildCursorToolCallChunk streams one caller-executed tool call as an OpenAI
+// delta.tool_calls entry. Cursor's exec protocol delivers the full argument
+// map at once, so a single chunk carries the complete call.
+func buildCursorToolCallChunk(id, model string, call cursor.ToolCallEvent, index int) string {
+	chunk := map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"delta": map[string]any{
+					"tool_calls": []map[string]any{
+						{
+							"index": index,
+							"id":    call.ID,
+							"type":  "function",
+							"function": map[string]any{
+								"name":      call.Name,
+								"arguments": call.RawArgs,
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	data, _ := json.Marshal(chunk)
 	return string(data)

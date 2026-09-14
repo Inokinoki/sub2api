@@ -59,12 +59,12 @@ func TestCursorMessagesFromChatFlattensTextParts(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	got := cursorMessagesFromChat([]apicompat.ChatMessage{
+	got := buildCursorAgentRunRequest("m", []apicompat.ChatMessage{
 		{Role: "user", Content: parts},
 		{Role: "assistant", Content: json.RawMessage(`"prior"`)},
-	})
-	require.Equal(t, "hello world", got[0].Content)
-	require.Equal(t, "prior", got[1].Content)
+	}, nil, "")
+	require.Equal(t, "hello world", got.Messages[0].Content)
+	require.Equal(t, "prior", got.Messages[1].Content)
 }
 
 func TestClaudeUsageFromCursorMapsCacheAndReasoning(t *testing.T) {
