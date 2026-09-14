@@ -23,7 +23,7 @@ type CursorGatewayService struct {
 	accountRepo     AccountRepository
 	refreshAPI      *OAuthRefreshAPI
 	refresher       *CursorTokenRefresher
-	streamChat      func(ctx context.Context, creds cursor.Credentials, messages []cursor.ChatMessage, model string, thinkingLevel int) (*http.Response, error)
+	streamChat      func(ctx context.Context, creds cursor.Credentials, messages []cursor.ChatMessage, model string) (*http.Response, error)
 	availableModels func(ctx context.Context, creds cursor.Credentials) ([]cursor.AvailableModel, error)
 
 	catalogMu        sync.Mutex
@@ -152,17 +152,12 @@ func (s *CursorGatewayService) startCursorChat(
 		logger.LegacyPrintf("service.cursor", "[Cursor] model resolve requested=%s upstream=%s", requestedModel, upstreamModel)
 	}
 
-	thinkingLevel := cursor.ThinkingLevelUnspecified
-	if strings.Contains(strings.ToLower(upstreamModel), "thinking") || strings.Contains(strings.ToLower(upstreamModel), "think") {
-		thinkingLevel = cursor.ThinkingLevelHigh
-	}
-
-	resp, err := s.doStreamChat(ctx, account, messages, upstreamModel, thinkingLevel)
+	resp, err := s.doStreamChat(ctx, account, messages, upstreamModel)
 	if err != nil && isCursorAuthError(err) {
 		if refreshErr := s.refreshCursorAccount(ctx, account, true); refreshErr != nil {
 			logger.LegacyPrintf("service.cursor", "[Cursor] auth retry refresh account=%d: %v", accountID(account), refreshErr)
 		} else {
-			resp, err = s.doStreamChat(ctx, account, messages, upstreamModel, thinkingLevel)
+			resp, err = s.doStreamChat(ctx, account, messages, upstreamModel)
 		}
 	}
 	if err != nil {
@@ -233,13 +228,12 @@ func (s *CursorGatewayService) doStreamChat(
 	account *Account,
 	messages []cursor.ChatMessage,
 	model string,
-	thinkingLevel int,
 ) (*http.Response, error) {
 	creds := s.buildCredentials(account)
 	if s != nil && s.streamChat != nil {
-		return s.streamChat(ctx, creds, messages, model, thinkingLevel)
+		return s.streamChat(ctx, creds, messages, model)
 	}
-	return cursor.NewClient(creds).StreamChat(ctx, messages, model, thinkingLevel)
+	return cursor.NewClient(creds).StreamChat(ctx, messages, model)
 }
 
 func accountID(account *Account) int64 {

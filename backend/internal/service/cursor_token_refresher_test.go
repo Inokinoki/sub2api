@@ -119,7 +119,7 @@ func TestCursorGatewayRefreshesExpiredTokenBeforeUpstream(t *testing.T) {
 	}
 
 	var seen []string
-	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string, _ int) (*http.Response, error) {
+	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string) (*http.Response, error) {
 		seen = append(seen, creds.AccessToken)
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
@@ -155,7 +155,7 @@ func TestCursorGatewayRetriesAfterUnauthorized(t *testing.T) {
 	}
 
 	var seen []string
-	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string, _ int) (*http.Response, error) {
+	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string) (*http.Response, error) {
 		seen = append(seen, creds.AccessToken)
 		if len(seen) == 1 {
 			return nil, fmt.Errorf("status 401: unauthorized")
@@ -190,7 +190,7 @@ func TestCursorGatewayResolvesRunSlugFromLiveCatalog(t *testing.T) {
 		}}, nil
 	}
 	var seen []string
-	svc.streamChat = func(_ context.Context, _ cursor.Credentials, _ []cursor.ChatMessage, model string, _ int) (*http.Response, error) {
+	svc.streamChat = func(_ context.Context, _ cursor.Credentials, _ []cursor.ChatMessage, model string) (*http.Response, error) {
 		seen = append(seen, model)
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
@@ -214,7 +214,7 @@ func TestCursorGatewayFallsBackToSnapshotWhenCatalogFails(t *testing.T) {
 		return nil, fmt.Errorf("catalog down")
 	}
 	var seen string
-	svc.streamChat = func(_ context.Context, _ cursor.Credentials, _ []cursor.ChatMessage, model string, _ int) (*http.Response, error) {
+	svc.streamChat = func(_ context.Context, _ cursor.Credentials, _ []cursor.ChatMessage, model string) (*http.Response, error) {
 		seen = model
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}

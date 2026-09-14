@@ -116,7 +116,7 @@ func (c *Client) EstablishSession(ctx context.Context) error {
 
 // StreamChat sends a chat completion request and returns the raw HTTP response
 // whose body contains Connect-RPC streaming frames. The caller must close the body.
-func (c *Client) StreamChat(ctx context.Context, messages []ChatMessage, model string, thinkingLevel int) (*http.Response, error) {
+func (c *Client) StreamChat(ctx context.Context, messages []ChatMessage, model string) (*http.Response, error) {
 	payload, _, runID := BuildAgentClientMessage(messages, model)
 	frame, err := EncodeFrame(payload, false)
 	if err != nil {
@@ -133,7 +133,6 @@ func (c *Client) StreamChat(ctx context.Context, messages []ChatMessage, model s
 		}
 		return resp, nil
 	}
-	_ = thinkingLevel
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("cursor: stream chat: %s", strings.Join(errs, " | "))
 	}
