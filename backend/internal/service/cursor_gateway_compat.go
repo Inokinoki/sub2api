@@ -243,7 +243,6 @@ func (s *CursorGatewayService) streamCursorAsAnthropic(
 	state := apicompat.NewChatCompletionsToAnthropicStreamState(model)
 	completionID := "chatcmpl-cursor-" + time.Now().Format("20060102150405")
 	var firstTokenMs *int
-	var totalText strings.Builder
 
 	writeEvents := func(events []apicompat.AnthropicStreamEvent) {
 		for _, event := range events {
@@ -266,12 +265,13 @@ func (s *CursorGatewayService) streamCursorAsAnthropic(
 			thinking = payload
 		} else {
 			text = payload
-			totalText.WriteString(payload)
 		}
 		writeEvents(apicompat.ChatCompletionsChunkToAnthropicEvents(cursorTextChunk(completionID, model, text, thinking), state))
 		return nil
 	})
-	if connectErr != "" && totalText.Len() == 0 {
+	// Surface upstream errors even after partial (thinking-only) output; an
+	// error event is terminal in Anthropic SSE, so the stream is not finalized.
+	if connectErr != "" {
 		_, errType, message := classifyCursorConnectError(connectErr)
 		fmt.Fprint(c.Writer, buildAnthropicStreamErrorSSE(errType, message))
 		c.Writer.Flush()
@@ -316,7 +316,6 @@ func (s *CursorGatewayService) streamCursorAsResponses(
 	state := apicompat.NewChatCompletionsToResponsesStreamState(model)
 	completionID := "chatcmpl-cursor-" + time.Now().Format("20060102150405")
 	var firstTokenMs *int
-	var totalText strings.Builder
 
 	writeEvents := func(events []apicompat.ResponsesStreamEvent) {
 		for _, event := range events {
@@ -339,12 +338,13 @@ func (s *CursorGatewayService) streamCursorAsResponses(
 			thinking = payload
 		} else {
 			text = payload
-			totalText.WriteString(payload)
 		}
 		writeEvents(apicompat.ChatCompletionsChunkToResponsesEvents(cursorTextChunk(completionID, model, text, thinking), state))
 		return nil
 	})
-	if connectErr != "" && totalText.Len() == 0 {
+	// Surface upstream errors even after partial (thinking-only) output; the
+	// error event replaces the completed events a clean end would emit.
+	if connectErr != "" {
 		_, errType, message := classifyCursorConnectError(connectErr)
 		payload, _ := json.Marshal(map[string]string{"code": errType, "message": message})
 		fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload)

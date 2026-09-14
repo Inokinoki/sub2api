@@ -416,7 +416,6 @@ func (s *CursorGatewayService) streamResponse(
 	}
 
 	var firstTokenMs *int
-	var emitted bool
 	completionID := "chatcmpl-cursor-" + time.Now().Format("20060102150405")
 
 	usage, connectErr := cursor.ConsumeAssistantStream(body, func(ev cursor.StreamEvent) error {
@@ -435,13 +434,14 @@ func (s *CursorGatewayService) streamResponse(
 		} else {
 			content = ev.Text
 		}
-		emitted = true
 		fmt.Fprintf(c.Writer, "data: %s\n\n", buildCursorSSEChunk(completionID, model, content, reasoning, ""))
 		c.Writer.Flush()
 		return nil
 	})
 
-	if connectErr != "" && !emitted {
+	// Surface upstream errors even after partial output: emitting a normal
+	// stop chunk here would mask a truncated generation as a clean finish.
+	if connectErr != "" {
 		_, errType, message := classifyCursorConnectError(connectErr)
 		errChunk, _ := json.Marshal(map[string]any{
 			"error": map[string]string{
