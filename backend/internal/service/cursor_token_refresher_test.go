@@ -252,6 +252,49 @@ func fakeCursorJWT(exp time.Time) string {
 	return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 }
 
+// TestCursorGatewayForceRefreshGoesThroughRefreshAPI verifies that the 401
+// retry path rotates credentials through OAuthRefreshAPI (locked, DB reread)
+// instead of a naked refresh, and that persisted credentials carry
+// _token_version so other workers pick up the rotation.
+func TestCursorGatewayForceRefreshGoesThroughRefreshAPI(t *testing.T) {
+	fresh := fakeCursorJWT(time.Now().Add(time.Hour))
+	account := &Account{
+		ID:       31,
+		Platform: PlatformCursor,
+		Type:     AccountTypeOAuth,
+		Status:   StatusActive,
+		Credentials: map[string]any{
+			"access_token":  fresh,
+			"refresh_token": "rt",
+		},
+	}
+	repo := &cursorCredRepo{account: account}
+	svc := NewCursorGatewayService(repo, NewOAuthRefreshAPI(repo, nil))
+	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
+		return nil, fmt.Errorf("catalog unused")
+	}
+	svc.refresher.refresh = func(context.Context, string) (*cursor.TokenRefreshResult, error) {
+		return &cursor.TokenRefreshResult{AccessToken: "rotated-401", ExpiresIn: 3600}, nil
+	}
+
+	var seen []string
+	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string) (*http.Response, error) {
+		seen = append(seen, creds.AccessToken)
+		if len(seen) == 1 {
+			return nil, fmt.Errorf("status 401: unauthorized")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	}
+
+	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, nil, "grok-4.6", cursor.RunOpts{})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, []string{fresh, "rotated-401"}, seen)
+	require.Equal(t, "rotated-401", account.GetCredential("access_token"))
+	require.Len(t, repo.updates, 1)
+	require.Contains(t, repo.updates[0], "_token_version")
+}
+
 func TestCursorAccountProxyURL(t *testing.T) {
 	require.Empty(t, cursorAccountProxyURL(nil))
 	require.Empty(t, cursorAccountProxyURL(&Account{}))

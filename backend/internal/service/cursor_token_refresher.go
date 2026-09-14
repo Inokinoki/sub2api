@@ -148,6 +148,11 @@ func (s *CursorGatewayService) ensureCursorAccessToken(ctx context.Context, acco
 	return s.refreshCursorAccount(ctx, account, false)
 }
 
+// refreshCursorAccount refreshes the account's access token when needed (or
+// forced after an upstream 401). Both modes go through OAuthRefreshAPI so the
+// refresh token rotation is serialized by the local/distributed locks and the
+// rotated credentials carry _token_version; the direct path is only a fallback
+// for test services without a refresh API.
 func (s *CursorGatewayService) refreshCursorAccount(ctx context.Context, account *Account, force bool) error {
 	if s == nil || account == nil {
 		return nil
@@ -164,8 +169,16 @@ func (s *CursorGatewayService) refreshCursorAccount(ctx context.Context, account
 		return nil
 	}
 
-	if s.refreshAPI != nil && !force {
-		result, err := s.refreshAPI.RefreshIfNeeded(withOAuthRefreshRequestPath(ctx), account, refresher, cursorTokenRefreshSkew)
+	if s.refreshAPI != nil {
+		var (
+			result *OAuthRefreshResult
+			err    error
+		)
+		if force {
+			result, err = s.refreshAPI.RefreshNow(withOAuthRefreshRequestPath(ctx), account, refresher)
+		} else {
+			result, err = s.refreshAPI.RefreshIfNeeded(withOAuthRefreshRequestPath(ctx), account, refresher, cursorTokenRefreshSkew)
+		}
 		if err != nil {
 			return err
 		}
