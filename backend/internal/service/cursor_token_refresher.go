@@ -105,6 +105,9 @@ func cursorAccessTokenExpiresAt(account *Account) *time.Time {
 }
 
 func applyCursorTokenCredentials(account *Account, result *cursor.TokenRefreshResult) map[string]any {
+	if account == nil {
+		return nil
+	}
 	if result == nil {
 		return MergeCredentials(account.Credentials, nil)
 	}
@@ -115,9 +118,6 @@ func applyCursorTokenCredentials(account *Account, result *cursor.TokenRefreshRe
 	}
 	if strings.TrimSpace(result.RefreshToken) != "" {
 		creds["refresh_token"] = strings.TrimSpace(result.RefreshToken)
-	}
-	if account == nil {
-		return creds
 	}
 	return MergeCredentials(account.Credentials, creds)
 }
