@@ -297,18 +297,25 @@ func (s *CursorGatewayService) liveRunCatalog(ctx context.Context, account *Acco
 	return models
 }
 
+// cursorLiveCatalogFetchTimeout caps the synchronous AvailableModels lookup on
+// the request hot path; on timeout the request falls back to the static
+// snapshot instead of stalling the client.
+const cursorLiveCatalogFetchTimeout = 5 * time.Second
+
 func (s *CursorGatewayService) fetchRunCatalog(ctx context.Context, account *Account) ([]cursor.AvailableModel, error) {
 	creds := cursorCredentialsFromAccount(account)
+	fetchCtx, cancel := context.WithTimeout(ctx, cursorLiveCatalogFetchTimeout)
+	defer cancel()
 	proxyURL := cursorAccountProxyURL(account)
 	if s.availableModels != nil {
-		return s.availableModels(ctx, creds)
+		return s.availableModels(fetchCtx, creds)
 	}
 	if strings.TrimSpace(creds.AccessToken) == "" {
 		return nil, fmt.Errorf("cursor: missing access_token")
 	}
 	client := cursor.NewClient(creds)
 	client.ProxyURL = proxyURL
-	return client.AvailableModels(ctx)
+	return client.AvailableModels(fetchCtx)
 }
 
 func (s *CursorGatewayService) cachedCatalog(accountID int64) []cursor.AvailableModel {
