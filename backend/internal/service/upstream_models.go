@@ -637,11 +637,11 @@ func (s *AccountTestService) fetchCursorUpstreamModels(ctx context.Context, acco
 	if creds.AccessToken == "" {
 		return nil, nil, newUpstreamModelSyncConfigError("Cursor access token is required", nil)
 	}
-	fetch := fetchCursorAvailableModels
+	var fetch func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error)
 	if s != nil && s.cursorAvailableModels != nil {
 		fetch = s.cursorAvailableModels
 	}
-	models, err := fetch(ctx, creds)
+	models, err := fetchCursorCatalog(ctx, account, fetch)
 	if err != nil {
 		return nil, nil, newUpstreamModelSyncUpstreamError("Failed to fetch Cursor model picker", err)
 	}

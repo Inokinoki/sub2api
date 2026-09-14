@@ -251,3 +251,21 @@ func fakeCursorJWT(exp time.Time) string {
 	payload, _ := json.Marshal(map[string]any{"exp": exp.Unix()})
 	return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 }
+
+func TestCursorAccountProxyURL(t *testing.T) {
+	require.Empty(t, cursorAccountProxyURL(nil))
+	require.Empty(t, cursorAccountProxyURL(&Account{}))
+
+	proxyID := int64(7)
+	account := &Account{
+		ProxyID: &proxyID,
+		Proxy: &Proxy{
+			Protocol: "http",
+			Host:     "proxy.local",
+			Port:     8080,
+			Username: "user",
+			Password: "pass",
+		},
+	}
+	require.Equal(t, "http://user:pass@proxy.local:8080", cursorAccountProxyURL(account))
+}

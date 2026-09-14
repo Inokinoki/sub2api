@@ -85,11 +85,9 @@ func (s *adminServiceImpl) GetGroupModelsListCandidates(ctx context.Context, id 
 	}
 
 	if platform == PlatformCursor {
-		fetch := fetchCursorAvailableModels
-		if s.cursorAvailableModels != nil {
-			fetch = s.cursorAvailableModels
-		}
-		if live := cursorPickerIDsFromAccounts(ctx, accounts, fetch); len(live) > 0 {
+		// nil fetch lets cursorPickerIDsFromAccounts dial through the account
+		// proxy; a seam overrides only in tests.
+		if live := cursorPickerIDsFromAccounts(ctx, accounts, s.cursorAvailableModels); len(live) > 0 {
 			candidates = live
 		}
 	}

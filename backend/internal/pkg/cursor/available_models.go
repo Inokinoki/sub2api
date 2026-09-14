@@ -107,7 +107,11 @@ func (c *Client) availableModelsOnce(ctx context.Context, connectRPC bool) ([]Av
 
 	httpClient := c.HTTPClient
 	if httpClient == nil {
-		httpClient = NewHTTP2Transport()
+		var err error
+		httpClient, err = StreamingHTTPClient(c.ProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("cursor: available models: %w", err)
+		}
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {

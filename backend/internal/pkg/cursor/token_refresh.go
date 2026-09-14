@@ -59,11 +59,32 @@ func RefreshSession(ctx context.Context, httpClient *http.Client, refreshToken s
 	return refreshTokenImpl(ctx, httpClient, refreshToken)
 }
 
+// RefreshSessionViaProxy exchanges a refresh token through the given
+// HTTP CONNECT / SOCKS5 proxy, using the shared transport pool.
+func RefreshSessionViaProxy(ctx context.Context, refreshToken, proxyURL string) (*TokenRefreshResult, error) {
+	httpClient, err := UnaryHTTPClient(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	return refreshTokenImpl(ctx, httpClient, refreshToken)
+}
+
 func refreshTokenImpl(ctx context.Context, httpClient *http.Client, refreshToken string) (*TokenRefreshResult, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
 		return nil, fmt.Errorf("cursor: missing refresh token")
 	}
+
+	if httpClient == nil {
+		var err error
+		httpClient, err = UnaryHTTPClient("")
+		if err != nil {
+			return nil, err
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, cursorUnaryTimeout)
+	defer cancel()
+
 	payload, err := json.Marshal(tokenRefreshRequest{
 		GrantType:    "refresh_token",
 		ClientID:     DefaultAuthClientID,
@@ -71,10 +92,6 @@ func refreshTokenImpl(ctx context.Context, httpClient *http.Client, refreshToken
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cursor: encode refresh request: %w", err)
-	}
-
-	if httpClient == nil {
-		httpClient = NewHTTP2Transport()
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL, bytes.NewReader(payload))

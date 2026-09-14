@@ -224,6 +224,14 @@ func (s *CursorGatewayService) buildCredentials(account *Account) cursor.Credent
 	return cursorCredentialsFromAccount(account)
 }
 
+// cursorAccountProxyURL resolves the account's hydrated proxy, if any.
+func cursorAccountProxyURL(account *Account) string {
+	if account == nil || account.ProxyID == nil || account.Proxy == nil {
+		return ""
+	}
+	return account.Proxy.URL()
+}
+
 func (s *CursorGatewayService) doStreamChat(
 	ctx context.Context,
 	account *Account,
@@ -234,7 +242,9 @@ func (s *CursorGatewayService) doStreamChat(
 	if s != nil && s.streamChat != nil {
 		return s.streamChat(ctx, creds, messages, model)
 	}
-	return cursor.NewClient(creds).StreamChat(ctx, messages, model)
+	client := cursor.NewClient(creds)
+	client.ProxyURL = cursorAccountProxyURL(account)
+	return client.StreamChat(ctx, messages, model)
 }
 
 func accountID(account *Account) int64 {
@@ -266,13 +276,6 @@ func normalizeCursorAccessToken(token string) string {
 	return token
 }
 
-func fetchCursorAvailableModels(ctx context.Context, creds cursor.Credentials) ([]cursor.AvailableModel, error) {
-	if strings.TrimSpace(creds.AccessToken) == "" {
-		return nil, fmt.Errorf("cursor: missing access_token")
-	}
-	return cursor.NewClient(creds).AvailableModels(ctx)
-}
-
 func (s *CursorGatewayService) liveRunCatalog(ctx context.Context, account *Account) []cursor.AvailableModel {
 	if s == nil || account == nil {
 		return nil
@@ -296,10 +299,16 @@ func (s *CursorGatewayService) liveRunCatalog(ctx context.Context, account *Acco
 
 func (s *CursorGatewayService) fetchRunCatalog(ctx context.Context, account *Account) ([]cursor.AvailableModel, error) {
 	creds := cursorCredentialsFromAccount(account)
+	proxyURL := cursorAccountProxyURL(account)
 	if s.availableModels != nil {
 		return s.availableModels(ctx, creds)
 	}
-	return fetchCursorAvailableModels(ctx, creds)
+	if strings.TrimSpace(creds.AccessToken) == "" {
+		return nil, fmt.Errorf("cursor: missing access_token")
+	}
+	client := cursor.NewClient(creds)
+	client.ProxyURL = proxyURL
+	return client.AvailableModels(ctx)
 }
 
 func (s *CursorGatewayService) cachedCatalog(accountID int64) []cursor.AvailableModel {
@@ -326,7 +335,13 @@ func (s *CursorGatewayService) storeCatalog(accountID int64, models []cursor.Ava
 
 // FetchCursorPickerModels loads the live Cursor picker catalog for an account.
 func FetchCursorPickerModels(ctx context.Context, account *Account) ([]cursor.AvailableModel, error) {
-	return fetchCursorAvailableModels(ctx, cursorCredentialsFromAccount(account))
+	creds := cursorCredentialsFromAccount(account)
+	if strings.TrimSpace(creds.AccessToken) == "" {
+		return nil, fmt.Errorf("cursor: missing access_token")
+	}
+	client := cursor.NewClient(creds)
+	client.ProxyURL = cursorAccountProxyURL(account)
+	return client.AvailableModels(ctx)
 }
 
 func (s *GatewayService) cursorPickerModelIDs(ctx context.Context, accounts []Account) []string {
@@ -341,9 +356,6 @@ func cursorPickerIDsFromAccounts(
 	accounts []Account,
 	fetch func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error),
 ) []string {
-	if fetch == nil {
-		fetch = fetchCursorAvailableModels
-	}
 	for i := range accounts {
 		acc := &accounts[i]
 		if acc.Platform != PlatformCursor {
@@ -353,7 +365,7 @@ func cursorPickerIDsFromAccounts(
 		if creds.AccessToken == "" {
 			continue
 		}
-		models, err := fetch(ctx, creds)
+		models, err := fetchCursorCatalog(ctx, acc, fetch)
 		if err != nil {
 			logger.LegacyPrintf("service.cursor", "[Cursor] AvailableModels account=%d: %v", acc.ID, err)
 			continue
@@ -364,6 +376,25 @@ func cursorPickerIDsFromAccounts(
 		}
 	}
 	return nil
+}
+
+// fetchCursorCatalog fetches the picker catalog for one account. fetch is an
+// optional test seam; the default dials through the account's proxy.
+func fetchCursorCatalog(
+	ctx context.Context,
+	account *Account,
+	fetch func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error),
+) ([]cursor.AvailableModel, error) {
+	creds := cursorCredentialsFromAccount(account)
+	if strings.TrimSpace(creds.AccessToken) == "" {
+		return nil, fmt.Errorf("cursor: missing access_token")
+	}
+	if fetch != nil {
+		return fetch(ctx, creds)
+	}
+	client := cursor.NewClient(creds)
+	client.ProxyURL = cursorAccountProxyURL(account)
+	return client.AvailableModels(ctx)
 }
 
 func (s *CursorGatewayService) streamResponse(

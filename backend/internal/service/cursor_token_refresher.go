@@ -70,22 +70,21 @@ func (r *CursorTokenRefresher) Refresh(ctx context.Context, account *Account) (m
 		return nil, errCursorRefreshTokenMissing
 	}
 
-	result, err := r.doRefresh(ctx, refreshToken)
+	result, err := r.doRefresh(ctx, account, refreshToken)
 	if err != nil {
 		return nil, err
 	}
 	return applyCursorTokenCredentials(account, result), nil
 }
 
-func (r *CursorTokenRefresher) doRefresh(ctx context.Context, refreshToken string) (*cursor.TokenRefreshResult, error) {
+func (r *CursorTokenRefresher) doRefresh(ctx context.Context, account *Account, refreshToken string) (*cursor.TokenRefreshResult, error) {
 	if r != nil && r.refresh != nil {
 		return r.refresh(ctx, refreshToken)
 	}
-	var client *http.Client
-	if r != nil {
-		client = r.httpClient
+	if r != nil && r.httpClient != nil {
+		return cursor.RefreshSession(ctx, r.httpClient, refreshToken)
 	}
-	return cursor.RefreshSession(ctx, client, refreshToken)
+	return cursor.RefreshSessionViaProxy(ctx, refreshToken, cursorAccountProxyURL(account))
 }
 
 func CursorTokenCacheKey(account *Account) string {
