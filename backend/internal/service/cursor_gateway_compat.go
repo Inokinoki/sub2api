@@ -41,9 +41,9 @@ func (s *CursorGatewayService) ForwardAsAnthropic(
 		return nil, fmt.Errorf("cursor anthropic: convert: %w", err)
 	}
 
-	messages := cursorMessagesFromChat(ccReq.Messages)
 	mappedModel := account.GetMappedModel(req.Model)
-	resp, _, warnings, err := s.startCursorChat(ctx, c, account, messages, mappedModel, cursorRunOptsFromAnthropic(&req))
+	agentReq := cursor.AgentRunRequest{Model: mappedModel, Messages: cursorMessagesFromChat(ccReq.Messages)}
+	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, cursorRunOptsFromAnthropic(&req))
 	if err != nil {
 		return nil, err
 	}
@@ -81,9 +81,9 @@ func (s *CursorGatewayService) ForwardAsResponses(
 		return nil, fmt.Errorf("cursor responses: convert: %w", err)
 	}
 
-	messages := cursorMessagesFromChat(ccReq.Messages)
 	mappedModel := account.GetMappedModel(req.Model)
-	resp, _, warnings, err := s.startCursorChat(ctx, c, account, messages, mappedModel, cursorRunOptsFromResponses(&req))
+	agentReq := cursor.AgentRunRequest{Model: mappedModel, Messages: cursorMessagesFromChat(ccReq.Messages)}
+	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, cursorRunOptsFromResponses(&req))
 	if err != nil {
 		return nil, err
 	}

@@ -3,6 +3,7 @@ package cursor
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 // Wire types for protobuf encoding.
@@ -59,6 +60,14 @@ func (w *ProtobufWriter) Bytes(field uint32, v []byte) {
 	w.buf = append(w.buf, v...)
 }
 
+// appendDouble writes an IEEE-754 double in little-endian fixed64 form
+// (google.protobuf.Value number_value).
+func (w *ProtobufWriter) appendDouble(v float64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], math.Float64bits(v))
+	w.buf = append(w.buf, buf[:]...)
+}
+
 // ProtobufReader provides forward-only parsing of protobuf wire format.
 type ProtobufReader struct {
 	data []byte
@@ -76,7 +85,8 @@ type Field struct {
 	Num      uint32
 	WireType int
 	Varint   uint64
-	Data     []byte // for WireBytes
+	Double   float64 // for WireFixed64
+	Data     []byte  // for WireBytes
 }
 
 // Next reads the next field. Returns nil when done.
@@ -99,7 +109,9 @@ func (r *ProtobufReader) Next() (*Field, error) {
 		if r.pos+8 > len(r.data) {
 			return nil, fmt.Errorf("protobuf: short fixed64")
 		}
-		f.Varint = binary.LittleEndian.Uint64(r.data[r.pos : r.pos+8])
+		bits := binary.LittleEndian.Uint64(r.data[r.pos : r.pos+8])
+		f.Varint = bits
+		f.Double = math.Float64frombits(bits)
 		r.pos += 8
 	case WireBytes:
 		length, err2 := r.readVarint()

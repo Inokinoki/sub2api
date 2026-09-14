@@ -270,8 +270,8 @@ func (c *Client) EstablishSession(ctx context.Context) error {
 
 // StreamChat sends a chat completion request and returns the raw HTTP response
 // whose body contains Connect-RPC streaming frames. The caller must close the body.
-func (c *Client) StreamChat(ctx context.Context, messages []ChatMessage, model string) (*http.Response, error) {
-	payload, _, runID := BuildAgentClientMessage(messages, model)
+func (c *Client) StreamChat(ctx context.Context, req AgentRunRequest) (*http.Response, error) {
+	payload, _, runID := buildAgentRunMessage(req)
 	frame, err := EncodeFrame(payload, false)
 	if err != nil {
 		return nil, fmt.Errorf("cursor: encode NAL frame: %w", err)
@@ -280,7 +280,7 @@ func (c *Client) StreamChat(ctx context.Context, messages []ChatMessage, model s
 	hosts := nalHosts(c.BaseURL)
 	var errs []string
 	for _, host := range hosts {
-		resp, err := c.streamAgentRun(ctx, host, frame, runID)
+		resp, err := c.streamAgentRun(ctx, host, frame, runID, req)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s%s: %v", host, EndpointAgentRun, err))
 			continue
@@ -300,7 +300,7 @@ func nalHosts(override string) []string {
 	return []string{BaseURLAgentNGlobal, BaseURLAgentN, BaseURLAgentNEU}
 }
 
-func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, runID string) (*http.Response, error) {
+func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, runID string, req AgentRunRequest) (*http.Response, error) {
 	pr, pw := io.Pipe()
 	lw := &lockedPipeWriter{w: pw}
 	go func() {
@@ -309,14 +309,14 @@ func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, 
 		}
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+EndpointAgentRun, pr)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, host+EndpointAgentRun, pr)
 	if err != nil {
 		lw.Close()
 		return nil, err
 	}
 	headers := c.nalHeaders(runID)
 	for k, v := range headers {
-		req.Header.Set(k, v)
+		httpReq.Header.Set(k, v)
 	}
 
 	httpClient, err := c.httpClient()
@@ -324,7 +324,7 @@ func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, 
 		lw.Close()
 		return nil, err
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		lw.Close()
 		return nil, err
@@ -356,11 +356,12 @@ func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, 
 	go nalHeartbeatLoop(lw, stopHB)
 
 	resp.Body = &nalReadCloser{
-		src:    io.MultiReader(bytes.NewReader(raw), resp.Body),
-		body:   resp.Body,
-		writer: lw,
-		stopHB: stopHB,
-		blobs:  make(map[string][]byte),
+		src:       io.MultiReader(bytes.NewReader(raw), resp.Body),
+		body:      resp.Body,
+		writer:    lw,
+		stopHB:    stopHB,
+		blobs:     make(map[string][]byte),
+		responder: newExecResponder(req.Tools),
 	}
 	return resp, nil
 }
@@ -418,14 +419,22 @@ func nalHeartbeatLoop(w *lockedPipeWriter, stop <-chan struct{}) {
 	}
 }
 
+// frameWriter receives the client-side protocol frames (exec replies, KV
+// results, heartbeats) written while the response is being consumed.
+type frameWriter interface {
+	Write(p []byte) (int, error)
+	Close() error
+}
+
 type nalReadCloser struct {
-	src     io.Reader
-	body    io.Closer
-	writer  *lockedPipeWriter
-	stopHB  chan struct{}
-	blobs   map[string][]byte
-	pending []byte
-	closed  bool
+	src       io.Reader
+	body      io.Closer
+	writer    frameWriter
+	stopHB    chan struct{}
+	blobs     map[string][]byte
+	pending   []byte
+	closed    bool
+	responder *execResponder
 }
 
 func (n *nalReadCloser) Read(p []byte) (int, error) {
@@ -439,11 +448,97 @@ func (n *nalReadCloser) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if n.handleKV(frame.Payload) {
+		if n.handleServerFrame(frame.Payload) {
 			continue
 		}
 		n.pending = raw
 	}
+}
+
+// handleServerFrame answers protocol frames that require an inline reply
+// (KV blob store, exec handshakes, interaction queries). Answered frames are
+// consumed and never reach the downstream parser; conversation content passes
+// through untouched.
+func (n *nalReadCloser) handleServerFrame(payload []byte) bool {
+	if n.handleKV(payload) {
+		return true
+	}
+	return n.responder.handle(payload, n.writeReply)
+}
+
+type execResponder struct {
+	tools    []AgentTool
+	declared map[string]struct{}
+}
+
+func newExecResponder(tools []AgentTool) *execResponder {
+	if len(tools) == 0 {
+		return nil
+	}
+	declared := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		declared[strings.ToLower(tool.Name)] = struct{}{}
+	}
+	return &execResponder{tools: tools, declared: declared}
+}
+
+// handle answers exec and interaction-query frames. Declared MCP tool calls
+// receive the external-handoff acknowledgment (the API caller executes the
+// tool and delivers the result on its next request); anything else the gateway
+// cannot serve is explicitly rejected so the server-side turn never strands
+// on a frame nobody will answer.
+func (r *execResponder) handle(payload []byte, writeReply func([]byte)) bool {
+	if r == nil {
+		return false
+	}
+	exec := findAgentServerExec(payload)
+	if exec != nil {
+		frame := parseExecServerFrame(exec)
+		var reply []byte
+		switch frame.Kind {
+		case execKindRequestContext:
+			reply = EncodeRequestContextReply(frame.ID, frame.ExecID, r.tools)
+		case execKindMcpCall:
+			_, isDeclared := r.declared[strings.ToLower(frame.Tool.Name)]
+			if isDeclared {
+				reply = EncodeMcpHandoffReply(frame.ID, frame.ExecID)
+			} else {
+				reply = EncodeMcpToolNotFoundReply(frame.ID, frame.ExecID, frame.Tool.Name, declaredToolNames(r.tools))
+			}
+		case execKindOther:
+			reply = EncodeExecThrowReply(frame.ID, "unsupported exec request", "unsupported_exec_variant")
+		default:
+			return false
+		}
+		writeReply(reply)
+		return true
+	}
+	if queryID, queryField, ok := findAgentServerQuery(payload); ok {
+		if reply := EncodeInteractionRejectedReply(queryID, queryField); reply != nil {
+			writeReply(reply)
+		}
+		return true
+	}
+	return false
+}
+
+func (n *nalReadCloser) writeReply(reply []byte) {
+	if len(reply) == 0 {
+		return
+	}
+	frame, err := EncodeFrame(reply, false)
+	if err != nil {
+		return
+	}
+	_, _ = n.writer.Write(frame)
+}
+
+func declaredToolNames(tools []AgentTool) []string {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return names
 }
 
 func (n *nalReadCloser) handleKV(payload []byte) bool {

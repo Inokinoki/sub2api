@@ -83,7 +83,7 @@ func TestE2ECursorChat(t *testing.T) {
 	for _, model := range models {
 		t.Logf("Trying NAL AgentService/Run model=%s", model)
 		var err error
-		resp, err = client.StreamChat(ctx, messages, model)
+		resp, err = client.StreamChat(ctx, cursor.AgentRunRequest{Model: model, Messages: messages})
 		if err != nil {
 			t.Logf("StreamChat failed: %v", err)
 			continue
@@ -378,7 +378,7 @@ func diagnoseCursorModel(t *testing.T, client *cursor.Client, messages []cursor.
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	resp, err := client.StreamChat(ctx, messages, model)
+	resp, err := client.StreamChat(ctx, cursor.AgentRunRequest{Model: model, Messages: messages})
 	if err != nil {
 		t.Logf("StreamChat error: %v", err)
 		return

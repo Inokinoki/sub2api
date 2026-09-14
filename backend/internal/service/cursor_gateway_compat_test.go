@@ -174,8 +174,8 @@ func TestCursorForwardAsChatCompletionsAcceptsContentPartsArray(t *testing.T) {
 		return nil, fmt.Errorf("catalog unused")
 	}
 	var contents []string
-	svc.streamChat = func(_ context.Context, _ cursor.Credentials, messages []cursor.ChatMessage, _ string) (*http.Response, error) {
-		for _, m := range messages {
+	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
+		for _, m := range req.Messages {
 			contents = append(contents, m.Content)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil

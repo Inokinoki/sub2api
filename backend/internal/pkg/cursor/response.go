@@ -150,6 +150,13 @@ func parseAgentServerMessage(data []byte) ([]StreamEvent, bool) {
 			}
 		case fieldAgentServerKV:
 			handled = true
+		case fieldAgentServerExec:
+			handled = true
+			frame := parseExecServerFrame(f.Data)
+			if frame.Kind == execKindMcpCall {
+				tool := frame.Tool
+				events = append(events, StreamEvent{Type: "tool_call", ToolCall: &tool})
+			}
 		}
 	}
 	return events, handled
@@ -351,7 +358,7 @@ func ConsumeAssistantStream(body io.Reader, emit func(StreamEvent) error) (Token
 		for _, ev := range events {
 			acc.Observe(ev)
 			switch ev.Type {
-			case "text", "thinking":
+			case "text", "thinking", "tool_call":
 				if emit != nil {
 					if err := emit(ev); err != nil {
 						return acc.Result(), connectErr

@@ -119,12 +119,12 @@ func TestCursorGatewayRefreshesExpiredTokenBeforeUpstream(t *testing.T) {
 	}
 
 	var seen []string
-	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string) (*http.Response, error) {
+	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ cursor.AgentRunRequest) (*http.Response, error) {
 		seen = append(seen, creds.AccessToken)
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, nil, "grok-4.6", cursor.RunOpts{})
+	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	resp.Body.Close()
@@ -155,7 +155,7 @@ func TestCursorGatewayRetriesAfterUnauthorized(t *testing.T) {
 	}
 
 	var seen []string
-	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string) (*http.Response, error) {
+	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ cursor.AgentRunRequest) (*http.Response, error) {
 		seen = append(seen, creds.AccessToken)
 		if len(seen) == 1 {
 			return nil, fmt.Errorf("status 401: unauthorized")
@@ -163,7 +163,7 @@ func TestCursorGatewayRetriesAfterUnauthorized(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, nil, "grok-4.6", cursor.RunOpts{})
+	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, []string{fresh, "after-401"}, seen)
@@ -190,18 +190,18 @@ func TestCursorGatewayResolvesRunSlugFromLiveCatalog(t *testing.T) {
 		}}, nil
 	}
 	var seen []string
-	svc.streamChat = func(_ context.Context, _ cursor.Credentials, _ []cursor.ChatMessage, model string) (*http.Response, error) {
-		seen = append(seen, model)
+	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
+		seen = append(seen, req.Model)
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, upstream, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, nil, "grok-4.6", cursor.RunOpts{})
+	resp, upstream, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, "cursor-grok-4.6-xhigh", upstream)
 	require.Equal(t, []string{"cursor-grok-4.6-xhigh"}, seen)
 
-	resp, _, _, err = svc.startCursorChat(context.Background(), newCursorGinContext(), account, nil, "grok-4.6", cursor.RunOpts{})
+	resp, _, _, err = svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, 1, fetches)
@@ -214,12 +214,12 @@ func TestCursorGatewayFallsBackToSnapshotWhenCatalogFails(t *testing.T) {
 		return nil, fmt.Errorf("catalog down")
 	}
 	var seen string
-	svc.streamChat = func(_ context.Context, _ cursor.Credentials, _ []cursor.ChatMessage, model string) (*http.Response, error) {
-		seen = model
+	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
+		seen = req.Model
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, upstream, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, nil, "grok-4.6", cursor.RunOpts{})
+	resp, upstream, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, "cursor-grok-4.6-medium", upstream)
@@ -278,7 +278,7 @@ func TestCursorGatewayForceRefreshGoesThroughRefreshAPI(t *testing.T) {
 	}
 
 	var seen []string
-	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ []cursor.ChatMessage, _ string) (*http.Response, error) {
+	svc.streamChat = func(_ context.Context, creds cursor.Credentials, _ cursor.AgentRunRequest) (*http.Response, error) {
 		seen = append(seen, creds.AccessToken)
 		if len(seen) == 1 {
 			return nil, fmt.Errorf("status 401: unauthorized")
@@ -286,7 +286,7 @@ func TestCursorGatewayForceRefreshGoesThroughRefreshAPI(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, nil, "grok-4.6", cursor.RunOpts{})
+	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, []string{fresh, "rotated-401"}, seen)

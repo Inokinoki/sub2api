@@ -13,6 +13,8 @@ const (
 	fieldAgentClientKV          = 3
 	fieldAgentClientHeartbeat   = 7
 	fieldAgentServerInteraction = 1
+	fieldAgentServerExec        = 2
+	fieldAgentServerQuery       = 7
 	fieldAgentServerKV          = 4
 
 	fieldRunConversationState = 1
@@ -80,23 +82,57 @@ const (
 	AgentModeAsk         = 2
 )
 
-// BuildAgentClientMessage encodes agent.v1.AgentClientMessage{run_request}.
+// AgentRunRequest describes one AgentService/Run invocation.
+type AgentRunRequest struct {
+	// Model is the resolved AgentService/Run slug.
+	Model string
+	// Messages carries the Ask-mode input (flattened by splitAskMessages).
+	// In Agent mode it should hold only the system prompt (optional) and the
+	// final user message; earlier history belongs in Turns.
+	Messages []ChatMessage
+	// Tools enables Agent mode: when non-empty the run declares the tool table
+	// (AgentRunRequest.mcp_tools), switches the conversation mode to Agent,
+	// and streams exec frames are answered inline (see execResponder).
+	Tools []AgentTool
+	// Turns is the replayed conversation history for Agent mode, one entry per
+	// prior user turn with the assistant's steps attached.
+	Turns []AgentTurn
+}
+
+// BuildAgentClientMessage encodes agent.v1.AgentClientMessage{run_request} for
+// a flattened Ask-mode conversation.
 func BuildAgentClientMessage(messages []ChatMessage, model string) (payload []byte, conversationID, runID string) {
-	if model == "" {
-		model = "default"
+	return buildAgentRunMessage(AgentRunRequest{Model: model, Messages: messages})
+}
+
+// buildAgentRunMessage encodes the run request for both conversation modes:
+// Ask (flattened messages, no tools) and Agent (tool table + replayed turns).
+func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, runID string) {
+	if req.Model == "" {
+		req.Model = "default"
 	}
 	conversationID = uuid.New().String()
 	runID = uuid.New().String()
 
-	systemPrompt, userText, prior := splitAskMessages(messages)
+	agentMode := len(req.Tools) > 0
+	mode := AgentModeAsk
+	if agentMode {
+		mode = AgentModeAgent
+	}
+	systemPrompt, userText, prior := splitAskMessages(req.Messages)
 
 	var state ProtobufWriter
-	state.Varint(fieldConvStateMode, AgentModeAsk)
+	state.Varint(fieldConvStateMode, mode)
+	if agentMode {
+		for _, turn := range EncodeAgentTurns(req.Turns) {
+			state.Bytes(fieldConvStateTurns, turn)
+		}
+	}
 
 	var userMsg ProtobufWriter
 	userMsg.String(fieldUserMsgText, userText)
 	userMsg.String(fieldUserMsgID, uuid.New().String())
-	userMsg.Varint(fieldUserMsgMode, AgentModeAsk)
+	userMsg.Varint(fieldUserMsgMode, mode)
 
 	var env ProtobufWriter
 	if rel := osRelease(); rel != "" {
@@ -113,28 +149,30 @@ func BuildAgentClientMessage(messages []ChatMessage, model string) (payload []by
 	var userAction ProtobufWriter
 	userAction.Bytes(fieldUserMsgActionMessage, userMsg.Result())
 	userAction.Bytes(fieldUserMsgActionContext, reqCtx.Result())
-	for _, p := range prior {
-		var pre ProtobufWriter
-		pre.String(fieldUserMsgText, p)
-		pre.String(fieldUserMsgID, uuid.New().String())
-		pre.Varint(fieldUserMsgMode, AgentModeAsk)
-		userAction.Bytes(fieldUserMsgActionPrepend, pre.Result())
+	if !agentMode {
+		for _, p := range prior {
+			var pre ProtobufWriter
+			pre.String(fieldUserMsgText, p)
+			pre.String(fieldUserMsgID, uuid.New().String())
+			pre.Varint(fieldUserMsgMode, AgentModeAsk)
+			userAction.Bytes(fieldUserMsgActionPrepend, pre.Result())
+		}
 	}
 
 	var action ProtobufWriter
 	action.Bytes(fieldActionUserMessage, userAction.Result())
 
 	var modelDetails ProtobufWriter
-	modelDetails.String(fieldModelID, model)
+	modelDetails.String(fieldModelID, req.Model)
 
 	var requested ProtobufWriter
-	requested.String(fieldModelID, model)
+	requested.String(fieldModelID, req.Model)
 
 	var run ProtobufWriter
 	run.Bytes(fieldRunConversationState, state.Result())
 	run.Bytes(fieldRunAction, action.Result())
 	run.Bytes(fieldRunModelDetails, modelDetails.Result())
-	run.Bytes(fieldRunMcpTools, nil)
+	run.Bytes(fieldRunMcpTools, agentToolsField(req))
 	run.String(fieldRunConversationID, conversationID)
 	if systemPrompt != "" {
 		run.String(fieldRunCustomSystem, systemPrompt)
@@ -145,6 +183,14 @@ func BuildAgentClientMessage(messages []ChatMessage, model string) (payload []by
 	var client ProtobufWriter
 	client.Bytes(fieldAgentClientRunRequest, run.Result())
 	return client.Result(), conversationID, runID
+}
+
+// agentToolsField renders the caller tool table for AgentRunRequest.mcp_tools.
+func agentToolsField(req AgentRunRequest) []byte {
+	if len(req.Tools) == 0 {
+		return nil
+	}
+	return EncodeAgentTools(req.Tools)
 }
 
 func encodeClientHeartbeat() []byte {

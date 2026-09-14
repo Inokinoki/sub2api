@@ -23,7 +23,7 @@ type CursorGatewayService struct {
 	accountRepo     AccountRepository
 	refreshAPI      *OAuthRefreshAPI
 	refresher       *CursorTokenRefresher
-	streamChat      func(ctx context.Context, creds cursor.Credentials, messages []cursor.ChatMessage, model string) (*http.Response, error)
+	streamChat      func(ctx context.Context, creds cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error)
 	availableModels func(ctx context.Context, creds cursor.Credentials) ([]cursor.AvailableModel, error)
 
 	catalogMu        sync.Mutex
@@ -95,7 +95,8 @@ func (s *CursorGatewayService) ForwardAsChatCompletions(
 
 	mappedModel := account.GetMappedModel(ccReq.Model)
 	opts := cursorRunOpts(ccReq.ReasoningEffort, ccReq.Reasoning, ccReq.Fast, ccReq.Thinking)
-	resp, _, warnings, err := s.startCursorChat(ctx, c, account, cursorMessages, mappedModel, opts)
+	agentReq := cursor.AgentRunRequest{Model: mappedModel, Messages: cursorMessages}
+	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -136,14 +137,14 @@ func (s *CursorGatewayService) startCursorChat(
 	ctx context.Context,
 	c *gin.Context,
 	account *Account,
-	messages []cursor.ChatMessage,
-	requestedModel string,
+	req cursor.AgentRunRequest,
 	opts cursor.RunOpts,
 ) (*http.Response, string, []map[string]string, error) {
 	if err := s.ensureCursorAccessToken(ctx, account); err != nil {
 		logger.LegacyPrintf("service.cursor", "[Cursor] token refresh account=%d: %v", accountID(account), err)
 	}
 
+	requestedModel := req.Model
 	upstreamModel, warnings := resolveCursorRunModel(requestedModel, opts, s.liveRunCatalog(ctx, account))
 	if requestedModel != "" && !strings.EqualFold(requestedModel, upstreamModel) {
 		c.Header("X-Sub2API-Model-Variant", requestedModel+" -> "+upstreamModel)
@@ -153,12 +154,12 @@ func (s *CursorGatewayService) startCursorChat(
 		logger.LegacyPrintf("service.cursor", "[Cursor] model resolve requested=%s upstream=%s", requestedModel, upstreamModel)
 	}
 
-	resp, err := s.doStreamChat(ctx, account, messages, upstreamModel)
+	resp, err := s.doStreamChat(ctx, account, req, upstreamModel)
 	if err != nil && isCursorAuthError(err) {
 		if refreshErr := s.refreshCursorAccount(ctx, account, true); refreshErr != nil {
 			logger.LegacyPrintf("service.cursor", "[Cursor] auth retry refresh account=%d: %v", accountID(account), refreshErr)
 		} else {
-			resp, err = s.doStreamChat(ctx, account, messages, upstreamModel)
+			resp, err = s.doStreamChat(ctx, account, req, upstreamModel)
 		}
 	}
 	if err != nil {
@@ -235,16 +236,17 @@ func cursorAccountProxyURL(account *Account) string {
 func (s *CursorGatewayService) doStreamChat(
 	ctx context.Context,
 	account *Account,
-	messages []cursor.ChatMessage,
+	req cursor.AgentRunRequest,
 	model string,
 ) (*http.Response, error) {
+	req.Model = model
 	creds := s.buildCredentials(account)
 	if s != nil && s.streamChat != nil {
-		return s.streamChat(ctx, creds, messages, model)
+		return s.streamChat(ctx, creds, req)
 	}
 	client := cursor.NewClient(creds)
 	client.ProxyURL = cursorAccountProxyURL(account)
-	return client.StreamChat(ctx, messages, model)
+	return client.StreamChat(ctx, req)
 }
 
 func accountID(account *Account) int64 {
