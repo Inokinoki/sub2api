@@ -2,7 +2,10 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -203,4 +206,29 @@ func encodeCursorThinkingAndTextFrames(t *testing.T, thinking, text string, inpu
 	endFrame, err := cursor.EncodeFrame(endServer.Result(), false)
 	require.NoError(t, err)
 	return append(out, endFrame...)
+}
+
+func TestCursorForwardAsChatCompletionsAcceptsContentPartsArray(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := cursorAccountWithFreshToken(21)
+	svc := NewCursorGatewayService(nil, nil)
+	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
+		return nil, fmt.Errorf("catalog unused")
+	}
+	var contents []string
+	svc.streamChat = func(_ context.Context, _ cursor.Credentials, messages []cursor.ChatMessage, _ string) (*http.Response, error) {
+		for _, m := range messages {
+			contents = append(contents, m.Content)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	}
+
+	body := []byte(`{"model":"claude-opus-5","stream":false,"messages":[{"role":"user","content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]},{"role":"assistant","content":null},{"role":"user","content":"plain"}]}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+
+	_, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.Equal(t, []string{"hello world", "", "plain"}, contents)
 }

@@ -78,10 +78,11 @@ func (s *CursorGatewayService) ForwardAsChatCompletions(
 		return nil, s.writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 	}
 
-	// Parse messages into cursor format
+	// Parse messages into cursor format. Content may be a plain string or an
+	// OpenAI content-parts array; both collapse to text.
 	var openAIMessages []struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(ccReq.Messages, &openAIMessages); err != nil {
 		return nil, s.writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse messages")
@@ -89,7 +90,7 @@ func (s *CursorGatewayService) ForwardAsChatCompletions(
 
 	cursorMessages := make([]cursor.ChatMessage, len(openAIMessages))
 	for i, m := range openAIMessages {
-		cursorMessages[i] = cursor.ChatMessage{Role: m.Role, Content: m.Content}
+		cursorMessages[i] = cursor.ChatMessage{Role: m.Role, Content: chatRawContentText(m.Content)}
 	}
 
 	mappedModel := account.GetMappedModel(ccReq.Model)
