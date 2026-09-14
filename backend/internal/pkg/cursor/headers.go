@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -106,7 +107,15 @@ func nodeArch() string {
 	}
 }
 
+// clientTimezone is resolved once per process: /etc/localtime does not change
+// for a running server, and this runs on every request via BuildHeaders.
+var clientTimezoneCached = sync.OnceValue(clientTimezoneOnce)
+
 func clientTimezone() string {
+	return clientTimezoneCached()
+}
+
+func clientTimezoneOnce() string {
 	out, err := exec.Command("readlink", "/etc/localtime").Output()
 	if err == nil {
 		s := strings.TrimSpace(string(out))
@@ -120,7 +129,13 @@ func clientTimezone() string {
 	return "UTC"
 }
 
+var osReleaseCached = sync.OnceValue(osReleaseOnce)
+
 func osRelease() string {
+	return osReleaseCached()
+}
+
+func osReleaseOnce() string {
 	out, err := exec.Command("uname", "-r").Output()
 	if err == nil {
 		if s := strings.TrimSpace(string(out)); s != "" {
