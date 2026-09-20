@@ -639,7 +639,7 @@ describe('Cursor credentials', () => {
         refreshToken: '',
         machineId,
         macMachineId,
-        clientVersion: '3.16.17'
+        clientVersion: '3.18.9'
       },
       'edit'
     )
@@ -648,7 +648,7 @@ describe('Cursor credentials', () => {
       credentials: {
         machine_id: machineId,
         mac_machine_id: macMachineId,
-        client_version: '3.16.17'
+        client_version: '3.18.9'
       }
     })
 
@@ -686,6 +686,7 @@ describe('buildCursorCredentials deep-control tokens', () => {
     expect(built.credentials.token_kind).toBe('deep_control')
     expect(built.credentials.machine_id).toBeUndefined()
     expect(built.credentials.mac_machine_id).toBeUndefined()
+    expect(built.credentials.client_version).toBeUndefined()
   })
 
   it('still validates pasted machine ids when present alongside deep-control tokens', () => {

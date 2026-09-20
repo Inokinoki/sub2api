@@ -13,9 +13,14 @@ import (
 )
 
 const (
-	DefaultClientVersion = "3.16.17"
-	DefaultClientCommit  = "6b2afae0257df2bb5e1835f15165dc2f0de056b0"
-	DefaultUserAgent     = "connect-es/1.6.1"
+	DefaultClientVersion = "3.18.9"
+	// DefaultCLIClientVersion is the version string the CLI credential
+	// profile sends. Live testing: agentn rejects IDE-style versions from
+	// client-type=cli with ERROR_OUTDATED_CLIENT; the CLI-style string is
+	// what the official CLI sends.
+	DefaultCLIClientVersion = "cli-2026.07.23-e383d2b"
+	DefaultClientCommit     = "6b2afae0257df2bb5e1835f15165dc2f0de056b0"
+	DefaultUserAgent        = "connect-es/1.6.1"
 )
 
 // Credentials holds the authentication data for a Cursor account.
@@ -50,7 +55,11 @@ func BuildHeaders(creds Credentials) map[string]string {
 	requestID := uuid.New().String()
 
 	if creds.MachineID == "" && creds.MacMachineID == "" {
-		return buildCLIHeaders(creds, version, tokenHash, requestID)
+		cliVersion := creds.ClientVersion
+		if cliVersion == "" {
+			cliVersion = DefaultCLIClientVersion
+		}
+		return buildCLIHeaders(creds, cliVersion, tokenHash, requestID)
 	}
 
 	ghostMode := "false"

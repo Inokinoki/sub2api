@@ -125,12 +125,18 @@ func TestRefreshViaUserAPIKeyRejectsErrors(t *testing.T) {
 func TestBuildHeadersCLIProfileWithoutMachineIDs(t *testing.T) {
 	h := BuildHeaders(Credentials{AccessToken: "at"})
 	require.Equal(t, "cli", h["x-cursor-client-type"])
+	require.Equal(t, DefaultCLIClientVersion, h["x-cursor-client-version"],
+		"CLI profile must send the CLI-style version; agentn rejects IDE versions with ERROR_OUTDATED_CLIENT")
 	require.NotContains(t, h, "x-cursor-checksum")
 	require.NotContains(t, h, "x-cursor-client-layout")
 	require.NotContains(t, h, "x-cursor-client-os")
 	require.Equal(t, "true", h["x-ghost-mode"])
 	require.Equal(t, "Bearer at", h["authorization"])
 	require.NotEmpty(t, h["x-client-key"])
+
+	// An explicit client_version credential overrides the CLI default.
+	custom := BuildHeaders(Credentials{AccessToken: "at", ClientVersion: "cli-custom"})
+	require.Equal(t, "cli-custom", custom["x-cursor-client-version"])
 
 	// A machine id (either kind) selects the IDE profile.
 	ide := BuildHeaders(Credentials{AccessToken: "at", MachineID: "m"})

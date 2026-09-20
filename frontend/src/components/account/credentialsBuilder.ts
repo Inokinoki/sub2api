@@ -568,7 +568,7 @@ export function applyPlanType(
 
 // ========== Cursor Pro (paste tokens from a local Cursor install) ==========
 
-export const CURSOR_DEFAULT_CLIENT_VERSION = '3.16.17'
+export const CURSOR_DEFAULT_CLIENT_VERSION = '3.18.9'
 
 const CURSOR_TELEMETRY_ID_RE = /^[0-9a-fA-F]{64}$/
 
@@ -638,8 +638,12 @@ export function buildCursorCredentials(
     return { ok: false, errorKey: 'admin.accounts.cursor.macMachineIdRequired' }
   }
 
+  // Deep-control accounts omit client_version so the backend sends its
+  // CLI-style default; an IDE version string gets rejected by agentn with
+  // ERROR_OUTDATED_CLIENT when paired with client-type=cli.
   const clientVersion =
-    fields.clientVersion.trim() || (mode === 'create' ? CURSOR_DEFAULT_CLIENT_VERSION : '')
+    fields.clientVersion.trim() ||
+    (mode === 'create' && !browserOAuth ? CURSOR_DEFAULT_CLIENT_VERSION : '')
   if (clientVersion) {
     credentials.client_version = clientVersion
   }

@@ -27,7 +27,8 @@ const (
 	EndpointUserAPIKey  = "/auth/exchange_user_api_key"
 
 	// TokenKindDeepControl marks credentials issued by the deep-control login
-	// flow; they refresh via exchange_user_api_key, not /oauth/token.
+	// flow. Informational: live testing showed these refresh tokens use the
+	// same /oauth/token endpoint as pasted session tokens.
 	TokenKindDeepControl = "deep_control"
 	// TokenKindSession marks credentials pasted from a local Cursor install
 	// (storage.json); they refresh via /oauth/token.
@@ -56,7 +57,9 @@ type AuthParams struct {
 
 // GenerateAuthParams builds a PKCE S256 pair plus the browser login URL.
 func GenerateAuthParams() (*AuthParams, error) {
-	raw := make([]byte, 32)
+	// 96 random bytes → 128-char base64url verifier, matching the CLI client
+	// (and PKCE's 43-128 char range comfortably).
+	raw := make([]byte, 96)
 	if _, err := rand.Read(raw); err != nil {
 		return nil, fmt.Errorf("cursor: generate verifier: %w", err)
 	}
@@ -153,9 +156,12 @@ func PollAuthSession(ctx context.Context, httpClient *http.Client, uuidStr, veri
 	}
 }
 
-// RefreshViaUserAPIKey exchanges a deep-control refresh token for a new
-// access token via auth/exchange_user_api_key (Bearer refresh token, empty
-// JSON body). This is the refresh path for tokens issued by auth/poll.
+// RefreshViaUserAPIKey exchanges a Cursor User API Key (created on
+// cursor.com/settings) for a session access token via
+// auth/exchange_user_api_key (Bearer API key, empty JSON body). It is NOT a
+// refresh endpoint for OAuth refresh tokens — live testing confirms both
+// session and deep-control refresh tokens use /oauth/token, and this endpoint
+// rejects refresh tokens with "Invalid User API Key".
 func RefreshViaUserAPIKey(ctx context.Context, httpClient *http.Client, refreshToken string) (*TokenRefreshResult, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {

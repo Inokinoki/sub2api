@@ -59,62 +59,23 @@ func TestCursorOAuthPollAuthRejectsMissingParams(t *testing.T) {
 	require.ErrorContains(t, err, "uuid and verifier")
 }
 
-func TestCursorTokenRefresherRoutesDeepControlToExchangeEndpoint(t *testing.T) {
-	var exchangeCalls, oauthTokenCalls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case cursor.EndpointUserAPIKey:
-			exchangeCalls++
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"accessToken":  "at-exchanged",
-				"refreshToken": "rt-rotated",
-			})
-		case "/oauth/token":
-			oauthTokenCalls++
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
-	restore := cursor.SetAuthEndpointsForTest(srv.URL, srv.URL)
-	t.Cleanup(restore)
-	cursor.SetOAuthTokenURLForTest(srv.URL + "/oauth/token")
-	t.Cleanup(func() { cursor.SetOAuthTokenURLForTest("") })
-
-	account := &Account{
-		ID:       51,
-		Platform: PlatformCursor,
-		Type:     AccountTypeOAuth,
-		Credentials: map[string]any{
-			"access_token":  "stale",
-			"refresh_token": "rt",
-			"token_kind":    cursor.TokenKindDeepControl,
-		},
-	}
-
-	refresher := NewCursorTokenRefresher()
-	refresher.httpClient = srv.Client()
-	creds, err := refresher.Refresh(context.Background(), account)
-	require.NoError(t, err)
-	require.Equal(t, 1, exchangeCalls)
-	require.Zero(t, oauthTokenCalls, "deep-control tokens must not hit /oauth/token")
-	require.Equal(t, "at-exchanged", creds["access_token"])
-	require.Equal(t, cursor.TokenKindDeepControl, creds["token_kind"], "token_kind must survive rotation")
-}
-
-func TestCursorTokenRefresherSessionFallsBackToExchange(t *testing.T) {
+// TestCursorTokenRefresherRefreshesAllKindsViaOAuthToken verifies that both
+// credential origins refresh through /oauth/token. Live testing showed
+// deep-control refresh tokens (browser login) and pasted session tokens use
+// the same endpoint; exchange_user_api_key serves User API Keys only and
+// rejects refresh tokens outright.
+func TestCursorTokenRefresherRefreshesAllKindsViaOAuthToken(t *testing.T) {
 	var oauthTokenCalls, exchangeCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/token":
 			oauthTokenCalls++
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token":  "at-refreshed",
+				"refresh_token": "",
+			})
 		case cursor.EndpointUserAPIKey:
 			exchangeCalls++
-			_ = json.NewEncoder(w).Encode(map[string]string{"accessToken": "at-fallback"})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -125,21 +86,27 @@ func TestCursorTokenRefresherSessionFallsBackToExchange(t *testing.T) {
 	cursor.SetOAuthTokenURLForTest(srv.URL + "/oauth/token")
 	t.Cleanup(func() { cursor.SetOAuthTokenURLForTest("") })
 
-	account := &Account{
-		ID:       52,
-		Platform: PlatformCursor,
-		Type:     AccountTypeOAuth,
-		Credentials: map[string]any{
-			"access_token":  "stale",
-			"refresh_token": "deep-control-token-without-kind",
-		},
-	}
+	for _, kind := range []string{cursor.TokenKindDeepControl, cursor.TokenKindSession, ""} {
+		account := &Account{
+			ID:       51,
+			Platform: PlatformCursor,
+			Type:     AccountTypeOAuth,
+			Credentials: map[string]any{
+				"access_token":  "stale",
+				"refresh_token": "rt",
+				"token_kind":    kind,
+			},
+		}
 
-	refresher := NewCursorTokenRefresher()
-	refresher.httpClient = srv.Client()
-	creds, err := refresher.Refresh(context.Background(), account)
-	require.NoError(t, err)
-	require.Equal(t, 1, oauthTokenCalls)
-	require.Equal(t, 1, exchangeCalls)
-	require.Equal(t, "at-fallback", creds["access_token"])
+		refresher := NewCursorTokenRefresher()
+		refresher.httpClient = srv.Client()
+		creds, err := refresher.Refresh(context.Background(), account)
+		require.NoError(t, err)
+		require.Equal(t, "at-refreshed", creds["access_token"])
+		if kind != "" {
+			require.Equal(t, kind, creds["token_kind"], "token_kind must survive refresh")
+		}
+	}
+	require.Equal(t, 3, oauthTokenCalls)
+	require.Zero(t, exchangeCalls, "refresh must never touch exchange_user_api_key")
 }
