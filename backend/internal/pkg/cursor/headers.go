@@ -33,6 +33,13 @@ type Credentials struct {
 }
 
 // BuildHeaders constructs the HTTP headers Cursor 3.16's setCommonHeaders/bFg send.
+//
+// Two header profiles exist. With telemetry machine ids the request poses as
+// the IDE (client-type=ide + x-cursor-checksum, the fingerprint Cursor's
+// backend validates for IDE sessions). Without machine ids — deep-control
+// OAuth accounts have none — the request poses as the CLI client instead
+// (client-type=cli, no checksum, ghost mode), which Cursor accepts without
+// an install fingerprint. This mirrors the CLI's own header set.
 func BuildHeaders(creds Credentials) map[string]string {
 	version := creds.ClientVersion
 	if version == "" {
@@ -41,6 +48,10 @@ func BuildHeaders(creds Credentials) map[string]string {
 
 	tokenHash := sha256Hex(creds.AccessToken)
 	requestID := uuid.New().String()
+
+	if creds.MachineID == "" && creds.MacMachineID == "" {
+		return buildCLIHeaders(creds, version, tokenHash, requestID)
+	}
 
 	ghostMode := "false"
 	if creds.GhostMode {
@@ -73,6 +84,29 @@ func BuildHeaders(creds Credentials) map[string]string {
 	}
 	if creds.ClientCommit != "" {
 		h["x-cursor-client-commit"] = creds.ClientCommit
+	}
+	if creds.SessionID != "" {
+		h["x-session-id"] = creds.SessionID
+	}
+	return h
+}
+
+// buildCLIHeaders is the no-fingerprint profile used by CLI clients such as
+// the agent CLI: no checksum, no telemetry-derived fields, ghost mode on.
+func buildCLIHeaders(creds Credentials, version, tokenHash, requestID string) map[string]string {
+	h := map[string]string{
+		"authorization":            fmt.Sprintf("Bearer %s", creds.AccessToken),
+		"content-type":             "application/connect+proto",
+		"connect-protocol-version": "1",
+		"user-agent":               DefaultUserAgent,
+		"x-client-key":             tokenHash,
+		"x-cursor-client-version":  version,
+		"x-cursor-client-type":     "cli",
+		"x-cursor-timezone":        clientTimezone(),
+		// Ghost mode keeps gateway traffic out of the account's usage history
+		// in the IDE; the CLI sends this unconditionally.
+		"x-ghost-mode": "true",
+		"x-request-id": requestID,
 	}
 	if creds.SessionID != "" {
 		h["x-session-id"] = creds.SessionID

@@ -175,3 +175,13 @@ func decodeJWTSegment(seg string) ([]byte, error) {
 	}
 	return base64.URLEncoding.DecodeString(seg)
 }
+
+// SetOAuthTokenURLForTest overrides the /oauth/token endpoint; empty restores
+// the default. Test seam only.
+func SetOAuthTokenURLForTest(u string) {
+	if u == "" {
+		oauthTokenURL = BaseURLAPI + EndpointToken
+		return
+	}
+	oauthTokenURL = u
+}

@@ -82,9 +82,32 @@ func (r *CursorTokenRefresher) doRefresh(ctx context.Context, account *Account, 
 		return r.refresh(ctx, refreshToken)
 	}
 	if r != nil && r.httpClient != nil {
-		return cursor.RefreshSession(ctx, r.httpClient, refreshToken)
+		return r.refreshCredentials(ctx, account, r.httpClient, refreshToken)
 	}
-	return cursor.RefreshSessionViaProxy(ctx, refreshToken, cursorAccountProxyURL(account))
+	client, err := cursor.UnaryHTTPClient(cursorAccountProxyURL(account))
+	if err != nil {
+		return nil, err
+	}
+	return r.refreshCredentials(ctx, account, client, refreshToken)
+}
+
+// refreshCredentials routes to the refresh endpoint matching the credential
+// origin. Deep-control tokens (browser OAuth login) refresh via
+// exchange_user_api_key; pasted session tokens via /oauth/token, with a
+// one-shot fallback for deep-control tokens stored before token_kind was
+// recorded.
+func (r *CursorTokenRefresher) refreshCredentials(ctx context.Context, account *Account, client *http.Client, refreshToken string) (*cursor.TokenRefreshResult, error) {
+	if account != nil && account.GetCredential("token_kind") == cursor.TokenKindDeepControl {
+		return cursor.RefreshViaUserAPIKey(ctx, client, refreshToken)
+	}
+	result, err := cursor.RefreshSession(ctx, client, refreshToken)
+	if err == nil {
+		return result, nil
+	}
+	if fallback, fbErr := cursor.RefreshViaUserAPIKey(ctx, client, refreshToken); fbErr == nil {
+		return fallback, nil
+	}
+	return nil, err
 }
 
 func CursorTokenCacheKey(account *Account) string {
