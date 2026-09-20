@@ -493,9 +493,67 @@
         </div>
       </div>
 
-      <!-- Cursor Pro: paste tokens from a local Cursor install (not a browser OAuth flow) -->
+      <!-- Cursor Pro: browser deep-control OAuth or pasted session tokens -->
       <div v-if="form.platform === 'cursor'" class="space-y-4" data-testid="cursor-credentials">
-        <p class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.cursor.hint') }}</p>
+        <div class="grid grid-cols-2 gap-2" data-testid="cursor-auth-method">
+          <button
+            type="button"
+            data-testid="cursor-method-browser"
+            :class="[
+              'rounded-lg border-2 p-2.5 text-left text-sm transition-all',
+              cursorAuthMethod === 'browser'
+                ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/20'
+                : 'border-gray-200 hover:border-gray-400 dark:border-dark-600 dark:hover:border-gray-600'
+            ]"
+            @click="cursorAuthMethod = 'browser'"
+          >
+            {{ t('admin.accounts.cursor.methodBrowser') }}
+          </button>
+          <button
+            type="button"
+            data-testid="cursor-method-manual"
+            :class="[
+              'rounded-lg border-2 p-2.5 text-left text-sm transition-all',
+              cursorAuthMethod === 'manual'
+                ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/20'
+                : 'border-gray-200 hover:border-gray-400 dark:border-dark-600 dark:hover:border-gray-600'
+            ]"
+            @click="cursorAuthMethod = 'manual'"
+          >
+            {{ t('admin.accounts.cursor.methodManual') }}
+          </button>
+        </div>
+
+        <!-- Browser OAuth: open the link, sub2api polls until login completes -->
+        <div v-if="cursorAuthMethod === 'browser'" class="space-y-3 rounded-lg bg-gray-50 p-3 dark:bg-dark-700" data-testid="cursor-oauth-flow">
+          <p class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.cursor.oauthHint') }}</p>
+          <button
+            v-if="!cursorOAuthURL"
+            type="button"
+            class="btn btn-primary"
+            data-testid="cursor-oauth-start"
+            :disabled="cursorOAuthStarting"
+            @click="startCursorOAuthFlow"
+          >
+            {{ t('admin.accounts.cursor.oauthStart') }}
+          </button>
+          <template v-else>
+            <a :href="cursorOAuthURL" target="_blank" rel="noopener" class="btn btn-outline w-full truncate" data-testid="cursor-oauth-url">
+              {{ t('admin.accounts.cursor.oauthOpen') }}
+            </a>
+            <p v-if="!cursorAccessToken" class="text-xs text-amber-600 dark:text-amber-400" data-testid="cursor-oauth-waiting">
+              {{ t('admin.accounts.cursor.oauthWaiting') }}
+            </p>
+            <p v-if="cursorAccessToken" class="text-xs text-emerald-600 dark:text-emerald-400" data-testid="cursor-oauth-done">
+              {{ t('admin.accounts.cursor.oauthDone') }}
+            </p>
+            <p v-if="cursorOAuthError" class="text-xs text-red-600 dark:text-red-400" data-testid="cursor-oauth-error">
+              {{ cursorOAuthError }}
+            </p>
+          </template>
+        </div>
+
+        <p v-if="cursorAuthMethod === 'manual'" class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.cursor.hint') }}</p>
         <div>
           <label class="input-label">{{ t('admin.accounts.cursor.accessToken') }}</label>
           <input
@@ -4117,7 +4175,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, watch } from 'vue'
+import { ref, reactive, computed, watch, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 
@@ -4171,6 +4229,7 @@ import CnBaseUrlPresets from '@/components/account/CnBaseUrlPresets.vue'
 import OpenCodeGoProtocolRulesEditor from '@/components/account/OpenCodeGoProtocolRulesEditor.vue'
 import HeaderOverrideEditor from '@/components/account/HeaderOverrideEditor.vue'
 import { allSelectedGroupsEnableLongContextPricing } from '@/components/account/longContextBilling'
+import { startCursorOAuth, pollCursorOAuth } from '@/api/admin/cursor'
 import {
   applyAntigravityProjectID,
   applyHeaderOverride,
@@ -4391,6 +4450,68 @@ const cursorRefreshToken = ref('')
 const cursorMachineId = ref('')
 const cursorMacMachineId = ref('')
 const cursorClientVersion = ref(CURSOR_DEFAULT_CLIENT_VERSION)
+
+// ── Cursor 浏览器授权（deep-control 登录流）──
+// 管理员打开授权链接在 cursor.com 登录，前端轮询后端直到 Cursor 签发 token。
+const cursorAuthMethod = ref<'browser' | 'manual'>('manual')
+const cursorTokenKind = ref('')
+const cursorOAuthURL = ref('')
+const cursorOAuthUUID = ref('')
+const cursorOAuthVerifier = ref('')
+const cursorOAuthStarting = ref(false)
+const cursorOAuthError = ref('')
+let cursorOAuthTimer: ReturnType<typeof setInterval> | null = null
+let cursorOAuthAttempts = 0
+const CURSOR_OAUTH_MAX_ATTEMPTS = 90
+
+function stopCursorOAuthPolling() {
+  if (cursorOAuthTimer) {
+    clearInterval(cursorOAuthTimer)
+    cursorOAuthTimer = null
+  }
+}
+
+onUnmounted(stopCursorOAuthPolling)
+
+async function startCursorOAuthFlow() {
+  cursorOAuthError.value = ''
+  cursorOAuthStarting.value = true
+  try {
+    const res = await startCursorOAuth()
+    cursorOAuthURL.value = res.url
+    cursorOAuthUUID.value = res.uuid
+    cursorOAuthVerifier.value = res.verifier
+    cursorOAuthAttempts = 0
+    stopCursorOAuthPolling()
+    cursorOAuthTimer = setInterval(pollCursorOAuthOnce, 2000)
+  } catch (e) {
+    cursorOAuthError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    cursorOAuthStarting.value = false
+  }
+}
+
+async function pollCursorOAuthOnce() {
+  if (!cursorOAuthURL.value || cursorAccessToken.value) return
+  cursorOAuthAttempts++
+  if (cursorOAuthAttempts > CURSOR_OAUTH_MAX_ATTEMPTS) {
+    stopCursorOAuthPolling()
+    cursorOAuthError.value = t('admin.accounts.cursor.oauthTimeout')
+    return
+  }
+  try {
+    const res = await pollCursorOAuth(cursorOAuthUUID.value, cursorOAuthVerifier.value, form.proxy_id)
+    if (res.done && res.credentials?.access_token) {
+      stopCursorOAuthPolling()
+      cursorAccessToken.value = res.credentials.access_token
+      cursorRefreshToken.value = res.credentials.refresh_token || ''
+      cursorTokenKind.value = res.credentials.token_kind || 'deep_control'
+      appStore.showSuccess(t('admin.accounts.cursor.oauthDone'))
+    }
+  } catch {
+    // 单次轮询失败不打断流程，下一轮重试；连续失败由上限兜底。
+  }
+}
 
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）账号类型、API 协议与端点 ──
 const accountMode = ref<CnAccountMode>('payg')
@@ -5629,6 +5750,13 @@ const resetForm = () => {
   cursorMachineId.value = ''
   cursorMacMachineId.value = ''
   cursorClientVersion.value = CURSOR_DEFAULT_CLIENT_VERSION
+  cursorAuthMethod.value = 'manual'
+  cursorTokenKind.value = ''
+  cursorOAuthURL.value = ''
+  cursorOAuthUUID.value = ''
+  cursorOAuthVerifier.value = ''
+  cursorOAuthError.value = ''
+  stopCursorOAuthPolling()
   interceptWarmupRequests.value = false
   autoPauseOnExpired.value = true
   openaiPassthroughEnabled.value = false
@@ -6051,7 +6179,8 @@ const handleSubmit = async () => {
         refreshToken: cursorRefreshToken.value,
         machineId: cursorMachineId.value,
         macMachineId: cursorMacMachineId.value,
-        clientVersion: cursorClientVersion.value
+        clientVersion: cursorClientVersion.value,
+        tokenKind: cursorTokenKind.value
       },
       'create'
     )

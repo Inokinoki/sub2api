@@ -665,3 +665,60 @@ describe('Cursor credentials', () => {
     expect(invalid.ok).toBe(false)
   })
 })
+
+describe('buildCursorCredentials deep-control tokens', () => {
+  it('omits machine ids when tokenKind is deep_control', () => {
+    const built = buildCursorCredentials(
+      {
+        accessToken: 'at',
+        refreshToken: 'rt',
+        machineId: '',
+        macMachineId: '',
+        clientVersion: '',
+        tokenKind: 'deep_control'
+      },
+      'create'
+    )
+    expect(built.ok).toBe(true)
+    if (!built.ok) return
+    expect(built.credentials.access_token).toBe('at')
+    expect(built.credentials.refresh_token).toBe('rt')
+    expect(built.credentials.token_kind).toBe('deep_control')
+    expect(built.credentials.machine_id).toBeUndefined()
+    expect(built.credentials.mac_machine_id).toBeUndefined()
+  })
+
+  it('still validates pasted machine ids when present alongside deep-control tokens', () => {
+    const built = buildCursorCredentials(
+      {
+        accessToken: 'at',
+        refreshToken: '',
+        machineId: 'not-hex!',
+        macMachineId: '',
+        clientVersion: '',
+        tokenKind: 'deep_control'
+      },
+      'create'
+    )
+    expect(built.ok).toBe(false)
+    if (built.ok) return
+    expect(built.errorKey).toBe('admin.accounts.cursor.machineIdInvalid')
+  })
+
+  it('still requires machine ids for pasted session tokens', () => {
+    const built = buildCursorCredentials(
+      {
+        accessToken: 'at',
+        refreshToken: '',
+        machineId: '',
+        macMachineId: '',
+        clientVersion: '',
+        tokenKind: ''
+      },
+      'create'
+    )
+    expect(built.ok).toBe(false)
+    if (built.ok) return
+    expect(built.errorKey).toBe('admin.accounts.cursor.machineIdRequired')
+  })
+})

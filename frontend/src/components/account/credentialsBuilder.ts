@@ -578,6 +578,8 @@ export type CursorCredentialFields = {
   machineId: string
   macMachineId: string
   clientVersion: string
+  /** 'deep_control' when the tokens came from the browser OAuth flow. */
+  tokenKind?: string
 }
 
 export function normalizeCursorAccessToken(raw: string): string {
@@ -599,6 +601,11 @@ export function buildCursorCredentials(
 ): { ok: true; credentials: Record<string, unknown> } | { ok: false; errorKey: string } {
   const credentials: Record<string, unknown> = {}
 
+  // Deep-control (browser OAuth) accounts authenticate as the CLI client and
+  // need no install fingerprint; pasted session tokens pose as the IDE and
+  // require both telemetry machine ids.
+  const browserOAuth = fields.tokenKind === 'deep_control'
+
   const accessToken = normalizeCursorAccessToken(fields.accessToken)
   if (accessToken) {
     credentials.access_token = accessToken
@@ -617,7 +624,7 @@ export function buildCursorCredentials(
       return { ok: false, errorKey: 'admin.accounts.cursor.machineIdInvalid' }
     }
     credentials.machine_id = machineId
-  } else if (mode === 'create') {
+  } else if (mode === 'create' && !browserOAuth) {
     return { ok: false, errorKey: 'admin.accounts.cursor.machineIdRequired' }
   }
 
@@ -627,7 +634,7 @@ export function buildCursorCredentials(
       return { ok: false, errorKey: 'admin.accounts.cursor.macMachineIdInvalid' }
     }
     credentials.mac_machine_id = macMachineId
-  } else if (mode === 'create') {
+  } else if (mode === 'create' && !browserOAuth) {
     return { ok: false, errorKey: 'admin.accounts.cursor.macMachineIdRequired' }
   }
 
@@ -635,6 +642,10 @@ export function buildCursorCredentials(
     fields.clientVersion.trim() || (mode === 'create' ? CURSOR_DEFAULT_CLIENT_VERSION : '')
   if (clientVersion) {
     credentials.client_version = clientVersion
+  }
+
+  if (browserOAuth) {
+    credentials.token_kind = 'deep_control'
   }
 
   return { ok: true, credentials }

@@ -755,6 +755,14 @@ export default {
         noResponseBody: 'No response body from server'
       },
       cursor: {
+        methodBrowser: 'Browser login',
+        methodManual: 'Paste tokens',
+        oauthHint: 'Generate a login link and authenticate on cursor.com in the browser; tokens are fetched automatically. No machine IDs required.',
+        oauthStart: 'Generate login link',
+        oauthOpen: 'Open Cursor login page',
+        oauthWaiting: 'Waiting for browser login…',
+        oauthDone: 'Authorized — tokens filled in. You can create the account now.',
+        oauthTimeout: 'Login wait timed out. Retry or switch to pasting tokens.',
         hint: 'Paste tokens from a Cursor Pro install. Access and refresh tokens are in Cursor’s local state DB (cursorAuth/accessToken, cursorAuth/refreshToken). Machine IDs are the 64-character hex values in storage.json under telemetry.machineId and telemetry.macMachineId — not the serviceMachineId UUID.',
         accessToken: 'Access token',
         accessTokenPlaceholder: 'Paste access token (userId::jwt is OK)',

@@ -832,6 +832,14 @@ export default {
         noResponseBody: '服务器未返回响应体'
       },
       cursor: {
+        methodBrowser: '浏览器授权',
+        methodManual: '粘贴 Token',
+        oauthHint: '点击生成授权链接并在浏览器中完成 Cursor 登录，系统会自动获取访问令牌。此方式无需机器 ID。',
+        oauthStart: '生成授权链接',
+        oauthOpen: '在浏览器中打开 Cursor 授权页',
+        oauthWaiting: '等待浏览器授权完成……',
+        oauthDone: '授权成功，已填入令牌。可直接创建账号。',
+        oauthTimeout: '授权等待超时，请重试或改用粘贴 Token 方式。',
         hint: '从 Cursor Pro 安装粘贴令牌。access / refresh token 在 Cursor 本地 state 数据库（cursorAuth/accessToken、cursorAuth/refreshToken）。机器 ID 是 storage.json 里 telemetry.machineId 与 telemetry.macMachineId 的 64 位十六进制值，不要用 serviceMachineId 那个 UUID。',
         accessToken: 'Access token',
         accessTokenPlaceholder: '粘贴 access token（userId::jwt 也可以）',
