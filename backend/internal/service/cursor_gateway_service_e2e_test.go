@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -264,18 +263,37 @@ func TestE2ECursorGatewayToolLoop(t *testing.T) {
 	t.Logf("round1 tool call id=%s args=%s", callID, choice.Message.ToolCalls[0].Function.Arguments)
 
 	// --- Round 2: return the executed result, expect a natural answer ---
-	round2 := []byte(`{
-		"model": "grok-4.6",
-		"stream": false,
-		"messages": [
-			{"role": "user", "content": "What is the weather in Paris right now? Use the get_weather tool."},
-			{"role": "assistant", "content": "", "tool_calls": [
-				{"id": "` + callID + `", "type": "function", "function": {"name": "get_weather", "arguments": ` + strconv.Quote(choice.Message.ToolCalls[0].Function.Arguments) + `}}
-			]},
-			{"role": "tool", "tool_call_id": "` + callID + `", "content": "Sunny, 21 degrees Celsius, wind 8 km/h."}
-		],
-		"tools": ` + toolsJSON + `
-	}`)
+	// Build with json.Marshal: the call id and arguments come from the model
+	// and may contain characters that break raw string interpolation.
+	round2Messages := []map[string]any{
+		{"role": "user", "content": "What is the weather in Paris right now? Use the get_weather tool."},
+		{"role": "assistant", "content": "", "tool_calls": []map[string]any{{
+			"id":   callID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      "get_weather",
+				"arguments": choice.Message.ToolCalls[0].Function.Arguments,
+			},
+		}}},
+		{"role": "tool", "tool_call_id": callID, "content": "Sunny, 21 degrees Celsius, wind 8 km/h."},
+	}
+	var rawArguments json.RawMessage = []byte(choice.Message.ToolCalls[0].Function.Arguments)
+	if !json.Valid(rawArguments) {
+		rawArguments = json.RawMessage(`{}`)
+	}
+	round2Messages[1]["tool_calls"].([]map[string]any)[0]["function"].(map[string]any)["arguments"] = string(rawArguments)
+	round2Body := map[string]any{
+		"model":    "grok-4.6",
+		"stream":   false,
+		"messages": round2Messages,
+	}
+	var round2Tools []any
+	if err := json.Unmarshal([]byte(toolsJSON), &round2Tools); err != nil {
+		t.Fatalf("embed tools: %v", err)
+	}
+	round2Body["tools"] = round2Tools
+	round2, err := json.Marshal(round2Body)
+	require.NoError(t, err)
 	rec2 := httptest.NewRecorder()
 	c2, _ := gin.CreateTestContext(rec2)
 	c2.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(round2))
