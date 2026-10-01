@@ -102,12 +102,13 @@ type AgentRunRequest struct {
 // BuildAgentClientMessage encodes agent.v1.AgentClientMessage{run_request} for
 // a flattened Ask-mode conversation.
 func BuildAgentClientMessage(messages []ChatMessage, model string) (payload []byte, conversationID, runID string) {
-	return buildAgentRunMessage(AgentRunRequest{Model: model, Messages: messages})
+	payload, conversationID, runID, _ = buildAgentRunMessage(AgentRunRequest{Model: model, Messages: messages})
+	return payload, conversationID, runID
 }
 
 // buildAgentRunMessage encodes the run request for both conversation modes:
 // Ask (flattened messages, no tools) and Agent (tool table + replayed turns).
-func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, runID string) {
+func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, runID string, promptBlobs *RootPromptBlobs) {
 	if req.Model == "" {
 		req.Model = "default"
 	}
@@ -124,8 +125,15 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 	var state ProtobufWriter
 	state.Varint(fieldConvStateMode, mode)
 	if agentMode {
-		for _, turn := range EncodeAgentTurns(req.Turns) {
-			state.Bytes(fieldConvStateTurns, turn)
+		promptBlobs = BuildRootPromptBlobs(systemPrompt, req.Turns)
+		// The server builds the model prompt from the root-prompt blobs, and
+		// turns[] holds blob ids of serialized ConversationTurn structures —
+		// inline messages there make the server fetch garbage blob ids.
+		for _, turnID := range EncodeAgentTurnBlobs(promptBlobs, req.Turns) {
+			state.Bytes(fieldConvStateTurns, turnID)
+		}
+		for _, id := range promptBlobs.IDs {
+			state.Bytes(fieldConvStateRootPrompts, id)
 		}
 	}
 
@@ -172,7 +180,11 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 	run.Bytes(fieldRunConversationState, state.Result())
 	run.Bytes(fieldRunAction, action.Result())
 	run.Bytes(fieldRunModelDetails, modelDetails.Result())
-	run.Bytes(fieldRunMcpTools, agentToolsField(req))
+	// The run-request tool table is how the model learns the tools exist
+	// (verified live: with it empty the model reports having no tools at all
+	// and the server never opens the request-context handshake). The
+	// request-context / mcp-state replies must stay consistent with it.
+	run.Bytes(fieldRunMcpTools, EncodeAgentTools(req.Tools))
 	run.String(fieldRunConversationID, conversationID)
 	if systemPrompt != "" {
 		run.String(fieldRunCustomSystem, systemPrompt)
@@ -182,15 +194,7 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 
 	var client ProtobufWriter
 	client.Bytes(fieldAgentClientRunRequest, run.Result())
-	return client.Result(), conversationID, runID
-}
-
-// agentToolsField renders the caller tool table for AgentRunRequest.mcp_tools.
-func agentToolsField(req AgentRunRequest) []byte {
-	if len(req.Tools) == 0 {
-		return nil
-	}
-	return EncodeAgentTools(req.Tools)
+	return client.Result(), conversationID, runID, promptBlobs
 }
 
 func encodeClientHeartbeat() []byte {

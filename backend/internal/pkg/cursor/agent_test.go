@@ -20,18 +20,19 @@ func TestEncodeAgentToolsGoldenFrame(t *testing.T) {
 	}})
 	require.NotEmpty(t, encoded)
 
-	// Outer container: field 1 (WireBytes) wrapping the definitions.
+	// McpTools is the repeated field itself: top-level reads yield each
+	// McpToolDefinition directly (field 1, WireBytes), with no wrapper.
 	container := NewProtobufReader(encoded)
 	f, err := container.Next()
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), f.Num)
 	require.Equal(t, WireBytes, f.WireType)
+	def := f
 
-	// Exactly one definition inside.
-	defs := NewProtobufReader(f.Data)
-	def, err := defs.Next()
+	// No further top-level entries beyond the single definition.
+	rest, err := container.Next()
 	require.NoError(t, err)
-	require.Equal(t, uint32(1), def.Num)
+	require.Nil(t, rest)
 
 	fields := map[uint32]string{}
 	var schema []byte
@@ -236,19 +237,39 @@ func TestEncodeMcpToolNotFoundReply(t *testing.T) {
 	require.True(t, found)
 }
 
-func TestEncodeInteractionRejectedReply(t *testing.T) {
-	// Known query kinds produce a rejected response frame.
-	for _, queryField := range []uint32{fieldInteractionQueryWebSearch, fieldInteractionQuerySwitchMo} {
-		encoded := EncodeInteractionRejectedReply(3, queryField)
+func TestEncodeInteractionQueryReply(t *testing.T) {
+	// Hosted search/fetch queries are approved with an empty approved result.
+	for _, queryField := range []uint32{
+		fieldInteractionQueryWebSearch,
+		fieldInteractionQueryExaSrch,
+		fieldInteractionQueryExaFetch,
+		fieldInteractionQueryWebFetch,
+	} {
+		encoded := EncodeInteractionQueryReply(3, queryField)
 		require.NotEmpty(t, encoded)
 		client := NewProtobufReader(encoded)
 		msg, err := client.Next()
 		require.NoError(t, err)
 		require.Equal(t, uint32(fieldAgentClientInteractionResp), msg.Num)
-		require.Contains(t, string(msg.Data), "not supported by this gateway")
+		// Approved result: oneof field with an empty approved message (field 1).
+		require.Contains(t, string(msg.Data), string([]byte{byte(fieldRequestResponseApproved)<<3 | 2, 0}))
+		require.NotContains(t, string(msg.Data), "not supported")
 	}
-	// Unknown query kinds are ignored (no reply).
-	require.Empty(t, EncodeInteractionRejectedReply(3, 99))
+	// Mode switches are declined.
+	encoded := EncodeInteractionQueryReply(3, fieldInteractionQuerySwitchMo)
+	require.NotNil(t, encoded)
+	client := NewProtobufReader(encoded)
+	msg, err := client.Next()
+	require.NoError(t, err)
+	require.Contains(t, string(msg.Data), "not supported by this gateway")
+	// Unknown query kinds get an approved-shaped reply (same field number) so
+	// the turn never stalls on an unanswered query.
+	unknown := EncodeInteractionQueryReply(3, 11)
+	require.NotEmpty(t, unknown)
+	unknownMsg, err := NewProtobufReader(unknown).Next()
+	require.NoError(t, err)
+	require.Equal(t, uint32(fieldAgentClientInteractionResp), unknownMsg.Num)
+	require.Contains(t, string(unknownMsg.Data), string([]byte{11<<3 | 2}))
 }
 
 func TestParseExecServerFrameKinds(t *testing.T) {
@@ -322,8 +343,9 @@ func TestParseMcpArgsMergesArgsMap(t *testing.T) {
 // TestEncodeAgentTurnsGoldenFrame locks the replay shape:
 // ConversationTurn{agent_conversation_turn=1{user_message=1, steps=2}} with
 // assistant/tool/thinking steps and paired McpToolCall results.
-func TestEncodeAgentTurnsGoldenFrame(t *testing.T) {
-	turns := EncodeAgentTurns([]AgentTurn{{
+func TestEncodeAgentTurnBlobsReferencesKVStoredTurns(t *testing.T) {
+	blobs := &RootPromptBlobs{ByIDs: make(map[string][]byte)}
+	turnIDs := EncodeAgentTurnBlobs(blobs, []AgentTurn{{
 		UserText: "what is the weather",
 		Steps: []AgentTurnStep{
 			{AssistantText: "let me check"},
@@ -336,73 +358,55 @@ func TestEncodeAgentTurnsGoldenFrame(t *testing.T) {
 			{AssistantText: "it is sunny"},
 		},
 	}})
-	require.Len(t, turns, 1)
+	require.Len(t, turnIDs, 1)
 
-	turn := NewProtobufReader(turns[0])
-	agentField, err := turn.Next()
-	require.NoError(t, err)
-	require.Equal(t, uint32(fieldTurnAgent), agentField.Num)
+	// Every declared id must be served by the blob set.
+	turn := blobs.ByIDs[string(turnIDs[0])]
+	require.NotNil(t, turn, "turn blob must exist")
+	require.Contains(t, blobs.ByIDs, string(turnIDs[0]))
 
-	agent := NewProtobufReader(agentField.Data)
-	var userSeen, assistantSeen, toolSeen int
-	var thinkingSeen int
-	var toolStep []byte
+	// The turn blob decodes as ConversationTurnStructure{agent_conversation_turn=1}.
+	agentField := GetNested(turn, fieldTurnAgent)
+	require.NotNil(t, agentField)
+
+	// Agent turn references a user-message blob and step blobs by id.
+	userID := GetNested(agentField, fieldAgentTurnUser)
+	require.NotNil(t, userID)
+	require.Len(t, userID, 32, "user message referenced by SHA-256 blob id")
+	userMsg := blobs.ByIDs[string(userID)]
+	require.NotNil(t, userMsg)
+	require.Contains(t, string(userMsg), "what is the weather")
+
+	steps := 0
+	pr := NewProtobufReader(agentField)
 	for {
-		f, err := agent.Next()
+		f, err := pr.Next()
 		if f == nil || err != nil {
 			break
 		}
-		switch {
-		case f.Num == fieldAgentTurnUser && f.WireType == WireBytes:
-			userSeen++
-			require.Contains(t, string(f.Data), "what is the weather")
-		case f.Num == fieldAgentTurnStep && f.WireType == WireBytes:
-			step := NewProtobufReader(f.Data)
-			sf, err := step.Next()
-			require.NoError(t, err)
-			switch sf.Num {
-			case fieldStepAssistant:
-				assistantSeen++
-			case fieldStepToolCall:
-				toolSeen++
-				toolStep = append([]byte(nil), sf.Data...)
-			case fieldStepThinking:
-				thinkingSeen++
-			}
+		if f.Num == fieldAgentTurnStep && f.WireType == WireBytes {
+			steps++
+			require.Len(t, f.Data, 32, "step referenced by blob id")
+			step := blobs.ByIDs[string(f.Data)]
+			require.NotNil(t, step)
 		}
 	}
-	require.Equal(t, 1, userSeen)
-	require.Equal(t, 2, assistantSeen)
-	require.Equal(t, 1, toolSeen)
-	require.Equal(t, 0, thinkingSeen)
+	require.Equal(t, 3, steps)
 
-	// Tool step payload is the ToolCall message itself:
-	// {mcp_tool_call=15{args=1, result=2}, tool_call_id=57}.
-	call := NewProtobufReader(toolStep)
-	var mcpSeen, idSeen bool
-	for {
-		f, err := call.Next()
-		if f == nil || err != nil {
-			break
-		}
-		switch {
-		case f.Num == fieldToolCallMcp && f.WireType == WireBytes:
-			mcpSeen = true
-			require.Contains(t, string(f.Data), "get_weather")
-			require.Contains(t, string(f.Data), "call-1")
-			require.Contains(t, string(f.Data), "sunny")
-		case f.Num == fieldToolCallCallIDE && f.WireType == WireBytes:
-			idSeen = true
-			require.Equal(t, "call-1", string(f.Data))
+	// The tool-call step blob pairs the call with its result.
+	for _, data := range blobs.ByIDs {
+		if bytes.Contains(data, []byte("get_weather")) && bytes.Contains(data, []byte("sunny")) {
+			return
 		}
 	}
-	require.True(t, mcpSeen)
-	require.True(t, idSeen)
+	t.Fatal("no blob pairs the tool call with its result")
 }
 
-func TestEncodeAgentTurnsEmptyTurnDropped(t *testing.T) {
-	require.Empty(t, EncodeAgentTurns(nil))
-	require.Empty(t, EncodeAgentTurns([]AgentTurn{{}}))
+func TestNormalizeToolCallID(t *testing.T) {
+	require.Equal(t, "call-abc_123", NormalizeToolCallID("call-abc\n123"))
+	require.Equal(t, "call_x", NormalizeToolCallID("call x"))
+	require.Len(t, NormalizeToolCallID(strings.Repeat("a", 100)), 64)
+	require.Equal(t, "call-1", NormalizeToolCallID("call-1"))
 }
 
 func TestSplitToolArgsJSON(t *testing.T) {
@@ -420,7 +424,7 @@ func TestSplitToolArgsJSON(t *testing.T) {
 }
 
 func TestBuildAgentRunMessageAgentMode(t *testing.T) {
-	payload, _, _ := buildAgentRunMessage(AgentRunRequest{
+	payload, _, _, _ := buildAgentRunMessage(AgentRunRequest{
 		Model: "claude-opus-5-high",
 		Messages: []ChatMessage{
 			{Role: "system", Content: "be terse"},
@@ -444,7 +448,7 @@ func TestBuildAgentRunMessageAgentMode(t *testing.T) {
 	require.NotNil(t, state)
 	require.Equal(t, uint64(AgentModeAgent), getVarint(state, fieldConvStateMode))
 
-	// Replayed turns ride on the conversation state.
+	// Replayed turns ride on the conversation state as 32-byte blob ids.
 	turnCount := 0
 	pr := NewProtobufReader(state)
 	for {
@@ -454,10 +458,25 @@ func TestBuildAgentRunMessageAgentMode(t *testing.T) {
 		}
 		if f.Num == fieldConvStateTurns && f.WireType == WireBytes {
 			turnCount++
-			require.Contains(t, string(f.Data), "hi")
+			require.Len(t, f.Data, 32, "turn referenced by blob id, not inline")
 		}
 	}
 	require.Equal(t, 1, turnCount)
+
+	// Root-prompt blob ids are also declared (field 1).
+	rootPromptIDs := 0
+	pr = NewProtobufReader(state)
+	for {
+		f, err := pr.Next()
+		if f == nil || err != nil {
+			break
+		}
+		if f.Num == fieldConvStateRootPrompts && f.WireType == WireBytes {
+			rootPromptIDs++
+			require.Len(t, f.Data, 32)
+		}
+	}
+	require.Positive(t, rootPromptIDs)
 
 	// Tool table declared on the run request.
 	tools := GetNested(runMsg, fieldRunMcpTools)
@@ -472,7 +491,7 @@ func TestBuildAgentRunMessageAgentMode(t *testing.T) {
 }
 
 func TestBuildAgentRunMessageAskModeUnchanged(t *testing.T) {
-	payload, _, _ := buildAgentRunMessage(AgentRunRequest{
+	payload, _, _, _ := buildAgentRunMessage(AgentRunRequest{
 		Model: "grok-4.6",
 		Messages: []ChatMessage{
 			{Role: "system", Content: "sys"},

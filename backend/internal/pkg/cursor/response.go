@@ -209,6 +209,13 @@ func parseInteractionUpdate(data []byte) ([]StreamEvent, bool) {
 					events = append(events, *ev)
 				}
 			}
+		case fieldInteractionToolCallStarted, fieldInteractionToolCallCompleted:
+			handled = true
+			if f.WireType == WireBytes {
+				if ev := parseToolCallUpdate(f.Data); ev != nil {
+					events = append(events, StreamEvent{Type: "tool_call", ToolCall: ev})
+				}
+			}
 		case fieldInteractionHeartbeat:
 			handled = true
 		case fieldInteractionTurnEnded:
@@ -341,10 +348,12 @@ func getVarint(data []byte, fieldNum uint32) uint64 {
 
 // ConsumeAssistantStream reads Connect-RPC AgentService/Run frames until the
 // turn ends. emit is invoked for text and thinking deltas; usage is accumulated
-// from turn_ended (preferred) or token_delta fallbacks.
+// from turn_ended (preferred) or token_delta fallbacks. A tool call may arrive
+// twice (exec frame and interaction update) — it is emitted once per call id.
 func ConsumeAssistantStream(body io.Reader, emit func(StreamEvent) error) (TokenUsage, string) {
 	var acc UsageAccumulator
 	var connectErr string
+	seenToolCalls := make(map[string]struct{})
 	for {
 		frame, err := DecodeFrame(body)
 		if err != nil {
@@ -358,7 +367,21 @@ func ConsumeAssistantStream(body io.Reader, emit func(StreamEvent) error) (Token
 		for _, ev := range events {
 			acc.Observe(ev)
 			switch ev.Type {
-			case "text", "thinking", "tool_call":
+			case "text", "thinking":
+				if emit != nil {
+					if err := emit(ev); err != nil {
+						return acc.Result(), connectErr
+					}
+				}
+			case "tool_call":
+				if ev.ToolCall == nil {
+					continue
+				}
+				key := ev.ToolCall.ID + "|" + ev.ToolCall.Name
+				if _, seen := seenToolCalls[key]; seen {
+					continue
+				}
+				seenToolCalls[key] = struct{}{}
 				if emit != nil {
 					if err := emit(ev); err != nil {
 						return acc.Result(), connectErr

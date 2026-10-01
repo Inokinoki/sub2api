@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -271,7 +272,7 @@ func (c *Client) EstablishSession(ctx context.Context) error {
 // StreamChat sends a chat completion request and returns the raw HTTP response
 // whose body contains Connect-RPC streaming frames. The caller must close the body.
 func (c *Client) StreamChat(ctx context.Context, req AgentRunRequest) (*http.Response, error) {
-	payload, _, runID := buildAgentRunMessage(req)
+	payload, _, runID, promptBlobs := buildAgentRunMessage(req)
 	frame, err := EncodeFrame(payload, false)
 	if err != nil {
 		return nil, fmt.Errorf("cursor: encode NAL frame: %w", err)
@@ -280,7 +281,7 @@ func (c *Client) StreamChat(ctx context.Context, req AgentRunRequest) (*http.Res
 	hosts := nalHosts(c.BaseURL)
 	var errs []string
 	for _, host := range hosts {
-		resp, err := c.streamAgentRun(ctx, host, frame, runID, req)
+		resp, err := c.streamAgentRun(ctx, host, frame, runID, req, promptBlobs)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s%s: %v", host, EndpointAgentRun, err))
 			continue
@@ -300,7 +301,7 @@ func nalHosts(override string) []string {
 	return []string{BaseURLAgentNGlobal, BaseURLAgentN, BaseURLAgentNEU}
 }
 
-func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, runID string, req AgentRunRequest) (*http.Response, error) {
+func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, runID string, req AgentRunRequest, promptBlobs *RootPromptBlobs) (*http.Response, error) {
 	pr, pw := io.Pipe()
 	lw := &lockedPipeWriter{w: pw}
 	go func() {
@@ -355,12 +356,16 @@ func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, 
 	stopHB := make(chan struct{})
 	go nalHeartbeatLoop(lw, stopHB)
 
+	blobs := make(map[string][]byte)
+	for id, data := range promptBlobs.ByIDs {
+		blobs[id] = data
+	}
 	resp.Body = &nalReadCloser{
 		src:       io.MultiReader(bytes.NewReader(raw), resp.Body),
 		body:      resp.Body,
 		writer:    lw,
 		stopHB:    stopHB,
-		blobs:     make(map[string][]byte),
+		blobs:     blobs,
 		responder: newExecResponder(req.Tools),
 	}
 	return resp, nil
@@ -456,9 +461,10 @@ func (n *nalReadCloser) Read(p []byte) (int, error) {
 }
 
 // handleServerFrame answers protocol frames that require an inline reply
-// (KV blob store, exec handshakes, interaction queries). Answered frames are
-// consumed and never reach the downstream parser; conversation content passes
-// through untouched.
+// (KV blob store, exec handshakes, interaction queries) and reports whether
+// the frame is fully consumed. MCP tool calls are answered with the handoff
+// acknowledgment AND passed through, so the downstream parser still surfaces
+// them as tool_call events.
 func (n *nalReadCloser) handleServerFrame(payload []byte) bool {
 	if n.handleKV(payload) {
 		return true
@@ -494,10 +500,14 @@ func (r *execResponder) handle(payload []byte, writeReply func([]byte)) bool {
 	exec := findAgentServerExec(payload)
 	if exec != nil {
 		frame := parseExecServerFrame(exec)
+		cursorDebugFrame("exec kind=%d id=%d tool=%q servers=%v", frame.Kind, frame.ID, frame.Tool.Name, frame.ServerIDs)
 		var reply []byte
+		passthrough := false
 		switch frame.Kind {
 		case execKindRequestContext:
 			reply = EncodeRequestContextReply(frame.ID, frame.ExecID, r.tools)
+		case execKindMcpState:
+			reply = EncodeMcpStateReply(frame.ID, frame.ExecID, r.tools, frame.ServerIDs)
 		case execKindMcpCall:
 			_, isDeclared := r.declared[strings.ToLower(frame.Tool.Name)]
 			if isDeclared {
@@ -505,16 +515,20 @@ func (r *execResponder) handle(payload []byte, writeReply func([]byte)) bool {
 			} else {
 				reply = EncodeMcpToolNotFoundReply(frame.ID, frame.ExecID, frame.Tool.Name, declaredToolNames(r.tools))
 			}
+			// The tool call must also reach the parser: it is the payload the
+			// gateway translates into client-facing tool_calls.
+			passthrough = true
 		case execKindOther:
 			reply = EncodeExecThrowReply(frame.ID, "unsupported exec request", "unsupported_exec_variant")
 		default:
 			return false
 		}
 		writeReply(reply)
-		return true
+		return !passthrough
 	}
 	if queryID, queryField, ok := findAgentServerQuery(payload); ok {
-		if reply := EncodeInteractionRejectedReply(queryID, queryField); reply != nil {
+		cursorDebugFrame("query id=%d field=%d", queryID, queryField)
+		if reply := EncodeInteractionQueryReply(queryID, queryField); reply != nil {
 			writeReply(reply)
 		}
 		return true
@@ -602,4 +616,13 @@ func summarizeCursorError(prefix []byte) string {
 		return string(s)
 	}
 	return "blocked stream"
+}
+
+// cursorDebugFrame prints protocol frame diagnostics when
+// CURSOR_DEBUG_FRAMES is set. Operational aid for reverse-engineered flows.
+func cursorDebugFrame(format string, args ...any) {
+	if os.Getenv("CURSOR_DEBUG_FRAMES") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[cursor-frame] "+format+"\n", args...)
 }

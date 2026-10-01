@@ -46,10 +46,11 @@ const (
 
 // ExecServerMessage / ExecClientMessage.
 const (
-	fieldExecID    = 1
-	fieldExecGUID  = 15
-	fieldExecRequr = 10 // RequestContextArgs / RequestContextResult
-	fieldExecMcp   = 11 // McpArgs / McpResult
+	fieldExecID     = 1
+	fieldExecGUID   = 15
+	fieldExecRequr  = 10 // RequestContextArgs / RequestContextResult
+	fieldExecMcp    = 11 // McpArgs / McpResult
+	fieldExecMcpSta = 36 // McpStateExecArgs / McpStateExecResult (tool discovery)
 )
 
 // McpArgs / McpResult / McpToolCall.
@@ -90,8 +91,9 @@ const (
 
 // ConversationStateStructure.
 const (
-	fieldConvStateTurns   = 8
-	fieldConvStateModeOld = 10 // nal.go fieldConvStateMode
+	fieldConvStateRootPrompts = 1 // repeated bytes: root-prompt blob ids
+	fieldConvStateTurns       = 8
+	fieldConvStateModeOld     = 10 // nal.go fieldConvStateMode
 )
 
 // RequestContext / RequestContextResult / RequestContextSuccess.
@@ -102,13 +104,43 @@ const (
 	fieldRequestCtxSuccessPayload = 1
 )
 
-// InteractionQuery / InteractionResponse oneof fields we know how to reject.
+// InteractionUpdate tool-call deliveries (ToolCallStartedUpdate /
+// ToolCallCompletedUpdate wrap the same ToolCall message).
+const (
+	fieldInteractionToolCallStarted   = 2
+	fieldInteractionToolCallCompleted = 3
+	fieldToolCallUpdateCallID         = 1
+	fieldToolCallUpdateToolCall       = 2
+)
+
+// McpStateExecResult fields.
+const (
+	fieldMcpStateServers       = 1
+	fieldMcpStateServerName    = 1
+	fieldMcpStateServerIdent   = 2
+	fieldMcpStateServerTools   = 5
+	fieldMcpStateServerStatus  = 7
+	fieldMcpStateResultSuccess = 1
+
+	// mcpStateServerConnected marks the pi-agent server as live; without it
+	// the model attempts an MCP authentication flow before calling tools.
+	mcpStateServerConnected = "connected"
+)
+
+// InteractionQuery / InteractionResponse oneof fields.
 const (
 	fieldInteractionQueryWebSearch = 2
 	fieldInteractionQuerySwitchMo  = 4
+	fieldInteractionQueryExaSrch   = 5
+	fieldInteractionQueryExaFetch  = 6
+	fieldInteractionQueryWebFetch  = 9
 	fieldInteractionRespID         = 1
 	fieldInteractionRespWebSearch  = 2
 	fieldInteractionRespSwitchMode = 4
+	fieldInteractionRespExaSrch    = 5
+	fieldInteractionRespExaFetch   = 6
+	fieldInteractionRespWebFetch   = 9
+	fieldRequestResponseApproved   = 1
 	fieldRequestResponseRejected   = 2
 	fieldRequestResponseReason     = 1
 )
@@ -147,9 +179,12 @@ func EncodeAgentTools(tools []AgentTool) []byte {
 		def.String(fieldToolDefToolName, tool.Name)
 		list.Bytes(fieldMcpToolsDefinitions, def.Result())
 	}
-	var out ProtobufWriter
-	out.Bytes(fieldMcpToolsDefinitions, list.Result())
-	return out.Result()
+	// McpTools is itself the repeated field: the message bytes are the
+	// concatenated definitions, with no extra wrapper. A wrapper layer here
+	// decodes server-side as one corrupted definition and the model never
+	// receives the tool table (observed live: schema-blind argument names and
+	// an MCP-authentication detour).
+	return list.Result()
 }
 
 // EncodeAgentToolsDeclaration wraps EncodeAgentTools for RequestContext.tools.
@@ -229,24 +264,43 @@ func EncodeMcpToolNotFoundReply(id uint64, execGUID, toolName string, declared [
 	return encodeExecReply(id, execGUID, fieldExecMcp, result.Result())
 }
 
-// EncodeInteractionRejectedReply declines an InteractionQuery the gateway
-// cannot serve (mode switches, server-side web search, ...). Returns nil for
-// query kinds without a known rejection shape; the caller then ignores the
-// frame rather than guessing.
-func EncodeInteractionRejectedReply(id uint64, queryField uint32) []byte {
+// EncodeInteractionQueryReply answers an InteractionQuery. Hosted web
+// search / fetch / exa queries are approved (Cursor executes them
+// server-side, mirroring the CLI client's behavior — rejecting them stalls
+// the turn); mode switches are declined. Returns nil for query kinds without
+// a known response shape, leaving the frame unanswered like the CLI does.
+func EncodeInteractionQueryReply(id uint64, queryField uint32) []byte {
 	var responseField uint32
+	approve := false
 	switch queryField {
 	case fieldInteractionQueryWebSearch:
-		responseField = fieldInteractionRespWebSearch
+		responseField, approve = fieldInteractionRespWebSearch, true
+	case fieldInteractionQueryExaSrch:
+		responseField, approve = fieldInteractionRespExaSrch, true
+	case fieldInteractionQueryExaFetch:
+		responseField, approve = fieldInteractionRespExaFetch, true
+	case fieldInteractionQueryWebFetch:
+		responseField, approve = fieldInteractionRespWebFetch, true
 	case fieldInteractionQuerySwitchMo:
 		responseField = fieldInteractionRespSwitchMode
 	default:
-		return nil
+		// Unknown query kinds (the backend ships new ones faster than any
+		// reverse-engineered proto): answer with an approved-shaped result
+		// under the same field number rather than leaving the turn stalled —
+		// live testing showed unanswered queries hang the stream. An empty
+		// approved result mirrors the hosted-search responses; if the shape is
+		// wrong the server errors visibly instead of deadlocking.
+		responseField = queryField
+		approve = true
 	}
-	var rejected ProtobufWriter
-	rejected.String(fieldRequestResponseReason, "not supported by this gateway")
+	var result ProtobufWriter
+	if approve {
+		result.Bytes(fieldRequestResponseApproved, nil)
+	} else {
+		result.String(fieldRequestResponseReason, "not supported by this gateway")
+	}
 	var response ProtobufWriter
-	response.Bytes(responseField, rejected.Result())
+	response.Bytes(responseField, result.Result())
 	var client ProtobufWriter
 	client.Varint(fieldInteractionRespID, int(id))
 	client.Bytes(responseField, response.Result())
@@ -291,54 +345,6 @@ type AgentTurnStep struct {
 type AgentTurn struct {
 	UserText string
 	Steps    []AgentTurnStep
-}
-
-// EncodeAgentTurns renders replay turns as ConversationStateStructure.turns
-// entries (one ConversationTurn message per entry).
-func EncodeAgentTurns(turns []AgentTurn) [][]byte {
-	out := make([][]byte, 0, len(turns))
-	for _, turn := range turns {
-		if encoded := encodeAgentTurn(turn); len(encoded) > 0 {
-			out = append(out, encoded)
-		}
-	}
-	return out
-}
-
-func encodeAgentTurn(turn AgentTurn) []byte {
-	var agent ProtobufWriter
-	if turn.UserText != "" {
-		var user ProtobufWriter
-		user.String(fieldUserMsgText, turn.UserText)
-		user.String(fieldUserMsgID, newReplayMessageID())
-		user.Varint(fieldUserMsgMode, AgentModeAgent)
-		agent.Bytes(fieldAgentTurnUser, user.Result())
-	}
-	for _, step := range turn.Steps {
-		if step.ToolCall != nil {
-			if encoded := encodeToolCallStep(*step.ToolCall); encoded != nil {
-				agent.Bytes(fieldAgentTurnStep, encoded)
-			}
-			continue
-		}
-		if step.AssistantText != "" {
-			var assistant ProtobufWriter
-			assistant.String(fieldStepAssistant, step.AssistantText)
-			agent.Bytes(fieldAgentTurnStep, assistant.Result())
-			continue
-		}
-		if step.ThinkingText != "" {
-			var thinking ProtobufWriter
-			thinking.String(fieldStepThinking, step.ThinkingText)
-			agent.Bytes(fieldAgentTurnStep, thinking.Result())
-		}
-	}
-	if len(agent.Result()) == 0 {
-		return nil
-	}
-	var turnMsg ProtobufWriter
-	turnMsg.Bytes(fieldTurnAgent, agent.Result())
-	return turnMsg.Result()
 }
 
 func encodeToolCallStep(record AgentToolCallRecord) []byte {
@@ -420,6 +426,7 @@ const (
 	execKindNone execKind = iota
 	execKindRequestContext
 	execKindMcpCall
+	execKindMcpState
 	execKindOther
 )
 
@@ -429,6 +436,8 @@ type execServerFrame struct {
 	Kind   execKind
 	// Tool is set when Kind == execKindMcpCall.
 	Tool ToolCallEvent
+	// ServerIDs are the identifiers an mcp_state query was scoped to.
+	ServerIDs []string
 }
 
 // parseExecServerFrame decodes the pieces of ExecServerMessage the gateway
@@ -451,6 +460,9 @@ func parseExecServerFrame(payload []byte) execServerFrame {
 		case f.Num == fieldExecMcp && f.WireType == WireBytes:
 			frame.Kind = execKindMcpCall
 			frame.Tool = parseMcpArgs(f.Data)
+		case f.Num == fieldExecMcpSta && f.WireType == WireBytes:
+			frame.Kind = execKindMcpState
+			frame.ServerIDs = parseMcpStateServerIDs(f.Data)
 		default:
 			if f.WireType == WireBytes || f.WireType == WireVarint {
 				if frame.Kind == execKindNone {
@@ -720,4 +732,98 @@ func findAgentServerQuery(payload []byte) (uint64, uint32, bool) {
 		}
 	}
 	return id, queryID, true
+}
+
+// parseMcpStateServerIDs extracts McpStateExecArgs.server_identifiers.
+func parseMcpStateServerIDs(payload []byte) []string {
+	var ids []string
+	pr := NewProtobufReader(payload)
+	for {
+		f, err := pr.Next()
+		if f == nil || err != nil {
+			break
+		}
+		if f.Num == 1 && f.WireType == WireBytes && len(f.Data) > 0 {
+			ids = append(ids, string(f.Data))
+		}
+	}
+	return ids
+}
+
+// EncodeMcpStateReply answers ExecServerMessage.mcp_state_exec_args — the
+// agent's tool discovery probe. The declared tool table is listed under the
+// pi-agent server; when the probe is scoped to other servers the honest
+// answer is an empty catalog.
+func EncodeMcpStateReply(id uint64, execGUID string, tools []AgentTool, requestedServerIDs []string) []byte {
+	var servers []byte
+	if len(requestedServerIDs) == 0 || containsFoldString(requestedServerIDs, AgentToolProviderIdentifier) {
+		var list ProtobufWriter
+		for _, tool := range tools {
+			schema, err := EncodeProtoJSONValue(orEmptySchema(tool.InputSchema))
+			if err != nil {
+				schema, _ = EncodeProtoJSONValue(orEmptySchema(nil))
+			}
+			var def ProtobufWriter
+			def.String(fieldToolDefName, tool.Name)
+			def.String(fieldToolDefDescription, tool.Description)
+			def.Bytes(fieldToolDefInputSchema, schema)
+			def.String(fieldToolDefProviderIdentifer, AgentToolProviderIdentifier)
+			def.String(fieldToolDefToolName, tool.Name)
+			list.Bytes(fieldMcpToolsDefinitions, def.Result())
+		}
+		var server ProtobufWriter
+		server.String(fieldMcpStateServerName, AgentToolProviderIdentifier)
+		server.String(fieldMcpStateServerIdent, AgentToolProviderIdentifier)
+		server.Bytes(fieldMcpStateServerTools, list.Result())
+		server.String(fieldMcpStateServerStatus, mcpStateServerConnected)
+		var serversMsg ProtobufWriter
+		serversMsg.Bytes(fieldMcpStateServers, server.Result())
+		servers = serversMsg.Result()
+	}
+	var success ProtobufWriter
+	success.Bytes(fieldMcpStateServers, servers)
+	var result ProtobufWriter
+	result.Bytes(fieldMcpStateResultSuccess, success.Result())
+	return encodeExecReply(id, execGUID, fieldExecMcpSta, result.Result())
+}
+
+func orEmptySchema(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
+func containsFoldString(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseToolCallUpdate decodes InteractionUpdate.tool_call_started /
+// tool_call_completed into a tool call event when the wrapped ToolCall is an
+// MCP call. Live streams deliver caller-executed tool calls this way.
+func parseToolCallUpdate(data []byte) *ToolCallEvent {
+	callID := GetString(data, fieldToolCallUpdateCallID)
+	toolCall := GetNested(data, fieldToolCallUpdateToolCall)
+	if toolCall == nil {
+		return nil
+	}
+	mcpCall := GetNested(toolCall, fieldToolCallMcp)
+	if mcpCall == nil {
+		// Native (shell/read/...) calls are not caller-executable; skip.
+		return nil
+	}
+	args := GetNested(mcpCall, fieldMcpCallArgs)
+	if args == nil {
+		return nil
+	}
+	event := parseMcpArgs(args)
+	if callID != "" && event.ID == "" {
+		event.ID = callID
+	}
+	return &event
 }

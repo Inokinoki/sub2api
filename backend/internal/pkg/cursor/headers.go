@@ -18,7 +18,7 @@ const (
 	// profile sends. Live testing: agentn rejects IDE-style versions from
 	// client-type=cli with ERROR_OUTDATED_CLIENT; the CLI-style string is
 	// what the official CLI sends.
-	DefaultCLIClientVersion = "cli-2026.07.23-e383d2b"
+	DefaultCLIClientVersion = "cli-2026.09.02-c22c1a3"
 	DefaultClientCommit     = "6b2afae0257df2bb5e1835f15165dc2f0de056b0"
 	DefaultUserAgent        = "connect-es/1.6.1"
 )

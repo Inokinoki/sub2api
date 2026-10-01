@@ -178,9 +178,10 @@ func TestNalReadCloserAnswersDeclaredToolCall(t *testing.T) {
 	consumed, err := io.ReadAll(nrc)
 	require.NoError(t, err)
 
-	// The exec frame is answered inline and never reaches the downstream
-	// parser; the turn_ended frame passes through.
-	require.NotContains(t, string(consumed), "get_weather")
+	// The exec frame is answered inline AND passed through — the tool call is
+	// the payload the gateway translates into client-facing tool_calls.
+	require.Contains(t, string(consumed), "get_weather")
+	require.Contains(t, string(consumed), "call-5")
 	// The turn_ended frame (AgentServerMessage field 1) still passes through.
 	require.Contains(t, string(consumed), string([]byte{byte(fieldAgentServerInteraction)<<3 | 2}))
 
@@ -195,8 +196,11 @@ func TestNalReadCloserRejectsUndeclaredToolCall(t *testing.T) {
 
 	consumed, err := io.ReadAll(nrc)
 	require.NoError(t, err)
-	require.NotContains(t, string(consumed), "phantom_tool")
+	// Undeclared calls still surface (the client sees the hallucinated call)
+	// but are answered with tool_not_found instead of a handoff promise.
+	require.Contains(t, string(consumed), "phantom_tool")
 	require.Contains(t, captured.String(), "phantom_tool")
+	require.NotContains(t, captured.String(), MCPExternalHandoffMessage)
 }
 
 func TestNalReadCloserPassthroughWithoutTools(t *testing.T) {
@@ -208,4 +212,106 @@ func TestNalReadCloserPassthroughWithoutTools(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(consumed), "get_weather")
 	require.Empty(t, captured.String())
+}
+
+func TestNalReadCloserAnswersMcpStateWithToolCatalog(t *testing.T) {
+	tools := []AgentTool{{Name: "get_weather", Description: "weather", InputSchema: json.RawMessage(`{"type":"object"}`)}}
+	var stateArgs ProtobufWriter
+	stateArgs.String(1, "other-server")
+	var exec ProtobufWriter
+	exec.Varint(fieldExecID, 8)
+	exec.Bytes(fieldExecMcpSta, stateArgs.Result())
+	var server ProtobufWriter
+	server.Bytes(fieldAgentServerExec, exec.Result())
+	frame, err := EncodeFrame(server.Result(), false)
+	require.NoError(t, err)
+
+	// Scoped to another server: consumed, empty catalog in the reply.
+	nrc, captured := newTestReadCloser(tools, frame)
+	consumed, err := io.ReadAll(nrc)
+	require.NoError(t, err)
+	require.NotContains(t, string(consumed), "get_weather")
+	// Scoped to another server: the reply carries an empty catalog (no tools).
+	require.NotEmpty(t, captured.String())
+	require.NotContains(t, captured.String(), "get_weather")
+
+	// Unscoped probe: the declared tool table is listed under pi-agent.
+	var bareArgs ProtobufWriter
+	var exec2 ProtobufWriter
+	exec2.Varint(fieldExecID, 9)
+	exec2.Bytes(fieldExecMcpSta, bareArgs.Result())
+	var server2 ProtobufWriter
+	server2.Bytes(fieldAgentServerExec, exec2.Result())
+	frame2, err := EncodeFrame(server2.Result(), false)
+	require.NoError(t, err)
+
+	nrc2, captured2 := newTestReadCloser(tools, frame2)
+	consumed2, err := io.ReadAll(nrc2)
+	require.NoError(t, err)
+	require.NotContains(t, string(consumed2), "get_weather")
+	require.Contains(t, captured2.String(), "get_weather")
+	require.Contains(t, captured2.String(), AgentToolProviderIdentifier)
+}
+
+func TestParseToolCallUpdateFromInteraction(t *testing.T) {
+	// ToolCallStartedUpdate{call_id=1, tool_call=2{mcp_tool_call=15{args=1}}}.
+	var mcpArgs ProtobufWriter
+	mcpArgs.String(fieldMcpArgsName, "get_weather")
+	mcpArgs.String(fieldMcpArgsToolCallID, "call-77")
+	var mcpCall ProtobufWriter
+	mcpCall.Bytes(fieldMcpCallArgs, mcpArgs.Result())
+	var toolCall ProtobufWriter
+	toolCall.Bytes(fieldToolCallMcp, mcpCall.Result())
+	var update ProtobufWriter
+	update.String(fieldToolCallUpdateCallID, "call-77")
+	update.Bytes(fieldToolCallUpdateToolCall, toolCall.Result())
+	var interaction ProtobufWriter
+	interaction.Bytes(fieldInteractionToolCallStarted, update.Result())
+	var server ProtobufWriter
+	server.Bytes(fieldAgentServerInteraction, interaction.Result())
+	frame, err := EncodeFrame(server.Result(), false)
+	require.NoError(t, err)
+
+	var events []StreamEvent
+	_, _ = ConsumeAssistantStream(bytes.NewReader(frame), func(ev StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	require.Len(t, events, 1)
+	require.Equal(t, "tool_call", events[0].Type)
+	require.Equal(t, "get_weather", events[0].ToolCall.Name)
+	require.Equal(t, "call-77", events[0].ToolCall.ID)
+}
+
+func TestConsumeAssistantStreamDedupesToolCallDeliveries(t *testing.T) {
+	buildFrame := func(interactionField uint32) []byte {
+		var mcpArgs ProtobufWriter
+		mcpArgs.String(fieldMcpArgsName, "get_weather")
+		mcpArgs.String(fieldMcpArgsToolCallID, "call-9")
+		var mcpCall ProtobufWriter
+		mcpCall.Bytes(fieldMcpCallArgs, mcpArgs.Result())
+		var toolCall ProtobufWriter
+		toolCall.Bytes(fieldToolCallMcp, mcpCall.Result())
+		var update ProtobufWriter
+		update.String(fieldToolCallUpdateCallID, "call-9")
+		update.Bytes(fieldToolCallUpdateToolCall, toolCall.Result())
+		var interaction ProtobufWriter
+		interaction.Bytes(interactionField, update.Result())
+		var server ProtobufWriter
+		server.Bytes(fieldAgentServerInteraction, interaction.Result())
+		frame, err := EncodeFrame(server.Result(), false)
+		require.NoError(t, err)
+		return frame
+	}
+
+	// The same call delivered as started and completed emits once.
+	body := append(buildFrame(fieldInteractionToolCallStarted), buildFrame(fieldInteractionToolCallCompleted)...)
+	var count int
+	_, _ = ConsumeAssistantStream(bytes.NewReader(body), func(ev StreamEvent) error {
+		if ev.Type == "tool_call" {
+			count++
+		}
+		return nil
+	})
+	require.Equal(t, 1, count)
 }
