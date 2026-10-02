@@ -38,6 +38,15 @@ const (
 	fieldUserMsgID   = 2
 	fieldUserMsgMode = 4
 
+	// UserMessage.selected_context / SelectedContext / SelectedImage.
+	fieldUserMsgSelectedContext    = 3
+	fieldSelectedContextImages     = 1
+	fieldSelectedImageData         = 8 // oneof data_or_blob_id: raw bytes
+	fieldSelectedImageUUID         = 2
+	fieldSelectedImageMime         = 7
+	fieldSelectedImageBlobID       = 1 // oneof: content hash id
+	fieldSelectedImageBlobWithData = 9 // oneof: {blob_id, data}
+
 	fieldReqCtxEnv = 4
 
 	fieldNALEnvOSVersion = 1
@@ -82,6 +91,12 @@ const (
 	AgentModeAsk         = 2
 )
 
+// AgentImage is one image attached to the active user message.
+type AgentImage struct {
+	Mime string
+	Data []byte
+}
+
 // AgentRunRequest describes one AgentService/Run invocation.
 type AgentRunRequest struct {
 	// Model is the resolved AgentService/Run slug.
@@ -97,6 +112,9 @@ type AgentRunRequest struct {
 	// Turns is the replayed conversation history for Agent mode, one entry per
 	// prior user turn with the assistant's steps attached.
 	Turns []AgentTurn
+	// Images attach to the active user message (UserMessage.selected_context)
+	// in both conversation modes. History replay is text-only.
+	Images []AgentImage
 }
 
 // BuildAgentClientMessage encodes agent.v1.AgentClientMessage{run_request} for
@@ -121,6 +139,9 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 		mode = AgentModeAgent
 	}
 	systemPrompt, userText, prior := splitAskMessages(req.Messages)
+	// The blob set is prepared before the user message encodes: images seed
+	// content-addressed entries the server may fetch by id.
+	imageBlobs := &RootPromptBlobs{ByIDs: make(map[string][]byte)}
 
 	var state ProtobufWriter
 	state.Varint(fieldConvStateMode, mode)
@@ -128,22 +149,28 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 	// the server rejects AgentRunRequest.custom_system_prompt outright
 	// ("unknown option '--system-prompt'", live-verified), so the blob path is
 	// the only system channel.
-	promptBlobs = BuildRootPromptBlobs(systemPrompt, nil)
+	rootBlobs := BuildRootPromptBlobs(systemPrompt, nil)
 	if agentMode {
-		promptBlobs = BuildRootPromptBlobs(systemPrompt, req.Turns)
+		// Oldest turns drop first once the history outgrows the prompt
+		// budget; pairing and recency are preserved (see TrimAgentTurns).
+		trimmed := TrimAgentTurns(req.Turns, cursorHistoryBlobBudget)
+		rootBlobs = BuildRootPromptBlobs(systemPrompt, trimmed)
 		// turns[] holds blob ids of serialized ConversationTurn structures —
 		// inline messages there make the server fetch garbage blob ids.
-		for _, turnID := range EncodeAgentTurnBlobs(promptBlobs, req.Turns) {
+		for _, turnID := range EncodeAgentTurnBlobs(rootBlobs, trimmed) {
 			state.Bytes(fieldConvStateTurns, turnID)
 		}
 	}
-	for _, id := range promptBlobs.IDs {
+	for _, id := range rootBlobs.IDs {
 		state.Bytes(fieldConvStateRootPrompts, id)
 	}
 
 	var userMsg ProtobufWriter
 	userMsg.String(fieldUserMsgText, userText)
 	userMsg.String(fieldUserMsgID, uuid.New().String())
+	if selectedContext := encodeSelectedImages(req.Images, imageBlobs); selectedContext != nil {
+		userMsg.Bytes(fieldUserMsgSelectedContext, selectedContext)
+	}
 	userMsg.Varint(fieldUserMsgMode, mode)
 
 	var env ProtobufWriter
@@ -200,6 +227,10 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 	run.Bytes(fieldRunRequestedModel, requested.Result())
 	run.String(fieldRunID, runID)
 
+	promptBlobs = rootBlobs
+	for id, data := range imageBlobs.ByIDs {
+		promptBlobs.ByIDs[id] = data
+	}
 	var client ProtobufWriter
 	client.Bytes(fieldAgentClientRunRequest, run.Result())
 	return client.Result(), conversationID, runID, promptBlobs

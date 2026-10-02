@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -860,4 +861,50 @@ func parseToolCallUpdate(data []byte) *ToolCallEvent {
 		event.ID = callID
 	}
 	return &event
+}
+
+// encodeSelectedImages renders SelectedContext{selected_images} for the
+// active user message. Each image rides as BlobIdWithData — the raw bytes
+// plus the content-addressed id so the server-side cache can be populated;
+// the KV store also serves the id if the server fetches by it instead
+// (live-verified: data alone triggers a KV fetch that 404s).
+func encodeSelectedImages(images []AgentImage, blobs *RootPromptBlobs) []byte {
+	if len(images) == 0 {
+		return nil
+	}
+	var list ProtobufWriter
+	for _, image := range images {
+		if len(image.Data) == 0 {
+			continue
+		}
+		id := sha256Sum(image.Data)
+		var blobWithData ProtobufWriter
+		blobWithData.Bytes(fieldSelectedImageBlobID, id)
+		blobWithData.Bytes(fieldSelectedImageData, image.Data)
+		var selected ProtobufWriter
+		selected.Bytes(fieldSelectedImageBlobWithData, blobWithData.Result())
+		selected.String(fieldSelectedImageUUID, uuid.New().String())
+		selected.String(fieldSelectedImageMime, image.Mime)
+		selectedBytes := selected.Result()
+		list.Bytes(fieldSelectedContextImages, selectedBytes)
+		if blobs != nil {
+			// Live-verified: the server resolves image blobs by BOTH the
+			// content hash and the serialized SelectedImage message itself
+			// (the KV get key echoes our uuid and bytes back), so seed both.
+			blobs.ByIDs[string(id)] = image.Data
+			blobs.ByIDs[string(selectedBytes)] = image.Data
+		}
+	}
+	if len(list.Result()) == 0 {
+		return nil
+	}
+	var ctx ProtobufWriter
+	ctx.Bytes(fieldSelectedContextImages, list.Result())
+	return ctx.Result()
+}
+
+// sha256Sum returns the raw 32-byte digest.
+func sha256Sum(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
 }

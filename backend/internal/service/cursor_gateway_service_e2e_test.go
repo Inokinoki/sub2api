@@ -3,7 +3,11 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -388,4 +392,69 @@ func TestE2ECursorGatewaySystemPromptWithTools(t *testing.T) {
 		require.True(t, matched,
 			"system prompt must be honored (French-only rule); content: %s", parsed.Choices[0].Message.Content)
 	}
+}
+
+// TestE2ECursorGatewayImageInput sends a solid-red generated PNG and expects
+// the model to name the color — the acceptance proof that selected_context
+// image delivery works against the live backend.
+func TestE2ECursorGatewayImageInput(t *testing.T) {
+	accessToken := os.Getenv("CURSOR_ACCESS_TOKEN")
+	if accessToken == "" {
+		t.Skip("CURSOR_ACCESS_TOKEN not set, skipping image e2e")
+	}
+	account := &Account{
+		ID: 1, Name: "cursor-e2e-image", Platform: PlatformCursor,
+		Credentials: map[string]any{"access_token": accessToken},
+	}
+
+	// Generate a 128x128 solid red PNG.
+	img := image.NewRGBA(image.Rect(0, 0, 128, 128))
+	for x := 0; x < 128; x++ {
+		for y := 0; y < 128; y++ {
+			img.Set(x, y, color.RGBA{R: 220, G: 20, B: 30, A: 255})
+		}
+	}
+	var pngBuf bytes.Buffer
+	require.NoError(t, png.Encode(&pngBuf, img))
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBuf.Bytes())
+
+	gin.SetMode(gin.TestMode)
+	svc := NewCursorGatewayService(nil, nil)
+
+	body := []byte(`{
+		"model": "grok-4.6",
+		"stream": false,
+		"messages": [{"role": "user", "content": [
+			{"type": "text", "text": "Look at the attached image. What single color fills it? Answer with just the color name."},
+			{"type": "image_url", "image_url": {"url": "` + dataURL + `"}}
+		]}]
+	}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	_, err := svc.ForwardAsChatCompletions(ctx, c, account, body)
+	require.NoError(t, err, "body: %s", rec.Body.String())
+
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &parsed), "body: %s", rec.Body.String())
+	if parsed.Error != nil {
+		t.Fatalf("upstream error: %s", parsed.Error.Message)
+	}
+	require.NotEmpty(t, parsed.Choices, "body: %s", rec.Body.String())
+	answer := strings.ToLower(parsed.Choices[0].Message.Content)
+	t.Logf("image answer: %q", parsed.Choices[0].Message.Content)
+	require.Contains(t, answer, "red",
+		"model must see the red image; answer: %s", parsed.Choices[0].Message.Content)
 }

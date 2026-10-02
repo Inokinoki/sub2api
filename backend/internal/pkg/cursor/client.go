@@ -575,7 +575,11 @@ func (n *nalReadCloser) handleKV(payload []byte) bool {
 		} else {
 			reply = encodeKVGetResult(op.id, nil, "blob not found")
 		}
-		cursorDebugFrame("kv get id=%d found=%v", op.id, found)
+		requested := op.getBlob
+		if len(requested) > 8 {
+			requested = requested[:8]
+		}
+		cursorDebugFrame("kv get id=%d found=%v requested=%x…", op.id, found, requested)
 	default:
 		return true
 	}

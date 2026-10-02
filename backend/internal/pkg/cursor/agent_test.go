@@ -523,6 +523,7 @@ func TestBuildAgentRunMessageAskModeUnchanged(t *testing.T) {
 	tools := GetNested(runMsg, fieldRunMcpTools)
 	require.Empty(t, tools)
 	turns := 0
+	rootPromptIDs := 0
 	pr := NewProtobufReader(state)
 	for {
 		f, err := pr.Next()
@@ -532,8 +533,13 @@ func TestBuildAgentRunMessageAskModeUnchanged(t *testing.T) {
 		if f.Num == fieldConvStateTurns {
 			turns++
 		}
+		if f.Num == fieldConvStateRootPrompts {
+			rootPromptIDs++
+		}
 	}
 	require.Zero(t, turns)
+	// The system prompt rides as a root-prompt blob even in Ask mode.
+	require.Equal(t, 1, rootPromptIDs)
 }
 
 // TestConsumeAssistantStreamSurfacesToolCalls proves exec-encoded MCP tool
@@ -571,4 +577,72 @@ func TestConsumeAssistantStreamSurfacesToolCalls(t *testing.T) {
 	require.NotNil(t, events[0].ToolCall)
 	require.Equal(t, "get_weather", events[0].ToolCall.Name)
 	require.Equal(t, "call-9", events[0].ToolCall.ID)
+}
+
+func TestBuildAgentRunMessageEncodesImages(t *testing.T) {
+	payload, _, _, _ := buildAgentRunMessage(AgentRunRequest{
+		Model: "grok-4.6",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "what is in this picture?"},
+		},
+		Images: []AgentImage{
+			{Mime: "image/png", Data: []byte{0x89, 0x50, 0x4E, 0x47}},
+		},
+	})
+
+	runMsg := GetNested(payload, fieldAgentClientRunRequest)
+	require.NotNil(t, runMsg)
+	action := GetNested(runMsg, fieldRunAction)
+	require.NotNil(t, action)
+	userAction := GetNested(action, fieldActionUserMessage)
+	require.NotNil(t, userAction)
+	userMsg := GetNested(userAction, fieldUserMsgActionMessage)
+	require.NotNil(t, userMsg)
+
+	// selected_context (field 3) wraps the image list with raw data payloads.
+	ctx := GetNested(userMsg, fieldUserMsgSelectedContext)
+	require.NotNil(t, ctx, "selected_context must be set when images present")
+	body := string(ctx)
+	require.Contains(t, body, "image/png")
+	require.Contains(t, body, string([]byte{0x89, 0x50, 0x4E, 0x47}))
+
+	// Without images the field is absent.
+	plain, _, _, _ := buildAgentRunMessage(AgentRunRequest{
+		Model:    "grok-4.6",
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	runPlain := GetNested(plain, fieldAgentClientRunRequest)
+	actionPlain := GetNested(runPlain, fieldRunAction)
+	userActionPlain := GetNested(actionPlain, fieldActionUserMessage)
+	userMsgPlain := GetNested(userActionPlain, fieldUserMsgActionMessage)
+	require.Nil(t, GetNested(userMsgPlain, fieldUserMsgSelectedContext))
+}
+
+func TestTrimAgentTurnsDropsOldestUnderBudget(t *testing.T) {
+	big := strings.Repeat("x", 1000)
+	turns := []AgentTurn{
+		{UserText: big, Steps: []AgentTurnStep{{AssistantText: big}}},
+		{UserText: big, Steps: []AgentTurnStep{{AssistantText: big}}},
+		{UserText: big, Steps: []AgentTurnStep{{AssistantText: big}}},
+	}
+	// Budget fits exactly one big turn: the two oldest drop, the newest stays.
+	trimmed := TrimAgentTurns(turns, 2100)
+	require.Len(t, trimmed, 1)
+	require.Equal(t, turns[2].UserText, trimmed[0].UserText, "most recent turn survives")
+
+	// A single oversized turn is never dropped.
+	solo := TrimAgentTurns(turns[:1], 10)
+	require.Len(t, solo, 1)
+
+	// Tool pairing inside kept turns is untouched.
+	withTool := []AgentTurn{
+		{UserText: big, Steps: []AgentTurnStep{{ToolCall: &AgentToolCallRecord{
+			CallID: "c1", Name: "t", ArgsJSON: json.RawMessage(`{}`),
+			Result: &AgentToolResultRecord{ContentText: big},
+		}}}},
+		{UserText: "latest"},
+	}
+	trimmedTool := TrimAgentTurns(withTool, 100)
+	require.Len(t, trimmedTool, 1)
+	require.Equal(t, "latest", trimmedTool[0].UserText)
 }

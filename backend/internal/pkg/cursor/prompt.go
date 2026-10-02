@@ -172,3 +172,51 @@ func EncodeAgentTurnBlobs(blobs *RootPromptBlobs, turns []AgentTurn) [][]byte {
 	}
 	return ids
 }
+
+// cursorHistoryBlobBudget caps the replayed-history prompt payload. Every
+// turn is re-sent as blobs on each request; without a cap a long agent
+// session grows the model prompt until it overflows the upstream context.
+// ~384KB of history JSON is roughly a 100k-token prompt — comfortably inside
+// current Cursor model contexts while allowing long sessions.
+const cursorHistoryBlobBudget = 384 * 1024
+
+// TrimAgentTurns drops the oldest turns until the history fits the byte
+// budget. Tool-call/result pairs live inside a single turn, so whole-turn
+// drops never orphan a call; the most recent turn always survives.
+func TrimAgentTurns(turns []AgentTurn, budget int) []AgentTurn {
+	if budget <= 0 {
+		budget = cursorHistoryBlobBudget
+	}
+	if len(turns) <= 1 {
+		return turns
+	}
+	sizes := make([]int, len(turns))
+	total := 0
+	for i, turn := range turns {
+		sizes[i] = agentTurnBlobSize(turn)
+		total += sizes[i]
+	}
+	start := 0
+	for total > budget && start < len(turns)-1 {
+		total -= sizes[start]
+		start++
+	}
+	return turns[start:]
+}
+
+// agentTurnBlobSize estimates a turn's prompt footprint from the JSON the
+// root-prompt blobs will carry (the wire adds per-entry framing overhead,
+// which the safety margin of the budget absorbs).
+func agentTurnBlobSize(turn AgentTurn) int {
+	total := len(turn.UserText)
+	for _, step := range turn.Steps {
+		total += len(step.AssistantText) + len(step.ThinkingText)
+		if step.ToolCall != nil {
+			total += len(step.ToolCall.Name) + len(step.ToolCall.ArgsJSON)
+			if step.ToolCall.Result != nil {
+				total += len(step.ToolCall.Result.ContentText)
+			}
+		}
+	}
+	return total
+}

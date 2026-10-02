@@ -71,7 +71,7 @@ func buildCursorAgentRunRequest(model string, messages []apicompat.ChatMessage, 
 		for _, message := range messages {
 			msgs = append(msgs, cursor.ChatMessage{Role: message.Role, Content: chatRawContentText(message.Content)})
 		}
-		return cursor.AgentRunRequest{Model: model, Messages: msgs}
+		return cursor.AgentRunRequest{Model: model, Messages: msgs, Images: collectCursorImages(messages)}
 	}
 
 	turns, systemPrompt, actionText := buildCursorAgentTurns(messages)
@@ -85,6 +85,7 @@ func buildCursorAgentRunRequest(model string, messages []apicompat.ChatMessage, 
 		Messages: msgs,
 		Tools:    buildCursorAgentTools(tools),
 		Turns:    turns,
+		Images:   collectCursorImages(messages),
 	}
 }
 
