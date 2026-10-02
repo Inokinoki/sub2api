@@ -99,9 +99,20 @@ const (
 // RequestContext / RequestContextResult / RequestContextSuccess.
 const (
 	fieldRequestContextResult     = 1
+	fieldRequestContextRules      = 2
 	fieldRequestContextTools      = 7
 	fieldRequestCtxResultSuccess  = 1
 	fieldRequestCtxSuccessPayload = 1
+
+	// CursorRule fields.
+	fieldRulePath    = 1
+	fieldRuleContent = 2
+	fieldRuleType    = 3
+	fieldRuleSource  = 4
+	fieldRuleGlobal  = 1 // CursorRuleType.global
+
+	// CursorRuleSource.USER.
+	cursorRuleSourceUser = 2
 )
 
 // InteractionUpdate tool-call deliveries (ToolCallStartedUpdate /
@@ -225,12 +236,35 @@ func encodeExecReply(id uint64, execGUID string, payloadField uint32, payload []
 	return client.Result()
 }
 
+// encodeSystemRule renders the system prompt as a global user CursorRule.
+func encodeSystemRule(systemPrompt string) []byte {
+	var rule ProtobufWriter
+	rule.String(fieldRulePath, "/sub2api/system-prompt/0.mdc")
+	rule.String(fieldRuleContent, systemPrompt)
+	var ruleType ProtobufWriter
+	ruleType.Bytes(fieldRuleGlobal, nil)
+	rule.Bytes(fieldRuleType, ruleType.Result())
+	rule.Varint(fieldRuleSource, cursorRuleSourceUser)
+	return rule.Result()
+}
+
 // EncodeRequestContextReply answers ExecServerMessage.request_context_args
-// with the declared tool table. A nil/empty answer strands the server-side
-// turn, so callers must always reply.
-func EncodeRequestContextReply(id uint64, execGUID string, tools []AgentTool) []byte {
+// with the declared tool table and the caller's system prompt as a global
+// user rule — live testing showed the model only obeys system instructions
+// delivered this way (the root-prompt blob alone is fetched but not applied).
+// A nil/empty answer strands the server-side turn, so callers must always
+// reply.
+func EncodeRequestContextReply(id uint64, execGUID string, systemPrompt string, tools []AgentTool) []byte {
+	// RequestContext body: rules (field 2) + tools (field 7). The two
+	// fragment writers emit discontiguous fields of the same message, so
+	// their bytes concatenate.
+	var ctx ProtobufWriter
+	if systemPrompt != "" {
+		ctx.Bytes(fieldRequestContextRules, encodeSystemRule(systemPrompt))
+	}
+	toolsFragment := encodeRequestContextTools(tools)
 	var success ProtobufWriter
-	success.Bytes(fieldRequestCtxSuccessPayload, encodeRequestContextTools(tools))
+	success.Bytes(fieldRequestCtxSuccessPayload, append(ctx.Result(), toolsFragment...))
 	var result ProtobufWriter
 	result.Bytes(fieldRequestContextResult, success.Result())
 	return encodeExecReply(id, execGUID, fieldExecRequr, result.Result())

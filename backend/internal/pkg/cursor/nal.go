@@ -124,17 +124,21 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 
 	var state ProtobufWriter
 	state.Varint(fieldConvStateMode, mode)
+	// The system prompt rides as the head root-prompt blob in BOTH modes:
+	// the server rejects AgentRunRequest.custom_system_prompt outright
+	// ("unknown option '--system-prompt'", live-verified), so the blob path is
+	// the only system channel.
+	promptBlobs = BuildRootPromptBlobs(systemPrompt, nil)
 	if agentMode {
 		promptBlobs = BuildRootPromptBlobs(systemPrompt, req.Turns)
-		// The server builds the model prompt from the root-prompt blobs, and
 		// turns[] holds blob ids of serialized ConversationTurn structures —
 		// inline messages there make the server fetch garbage blob ids.
 		for _, turnID := range EncodeAgentTurnBlobs(promptBlobs, req.Turns) {
 			state.Bytes(fieldConvStateTurns, turnID)
 		}
-		for _, id := range promptBlobs.IDs {
-			state.Bytes(fieldConvStateRootPrompts, id)
-		}
+	}
+	for _, id := range promptBlobs.IDs {
+		state.Bytes(fieldConvStateRootPrompts, id)
 	}
 
 	var userMsg ProtobufWriter
@@ -151,7 +155,14 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 	}
 	env.String(fieldNALEnvTimezone, clientTimezone())
 
+	// The action's inline RequestContext carries the system prompt as a
+	// global user rule (RequestContext.rules=2) alongside the env — the
+	// server never opens the request-context exec handshake in this flow
+	// (live-verified), so this is the rule channel that actually fires.
 	var reqCtx ProtobufWriter
+	if systemPrompt != "" {
+		reqCtx.Bytes(fieldRequestContextRules, encodeSystemRule(systemPrompt))
+	}
 	reqCtx.Bytes(fieldReqCtxEnv, env.Result())
 
 	var userAction ProtobufWriter
@@ -186,9 +197,6 @@ func buildAgentRunMessage(req AgentRunRequest) (payload []byte, conversationID, 
 	// request-context / mcp-state replies must stay consistent with it.
 	run.Bytes(fieldRunMcpTools, EncodeAgentTools(req.Tools))
 	run.String(fieldRunConversationID, conversationID)
-	if systemPrompt != "" {
-		run.String(fieldRunCustomSystem, systemPrompt)
-	}
 	run.Bytes(fieldRunRequestedModel, requested.Result())
 	run.String(fieldRunID, runID)
 

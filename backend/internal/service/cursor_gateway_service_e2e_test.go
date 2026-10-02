@@ -319,3 +319,73 @@ func TestE2ECursorGatewayToolLoop(t *testing.T) {
 	require.True(t, result2.Usage.InputTokens > 0 || result2.Usage.OutputTokens > 0,
 		"usage must be recorded for billing")
 }
+
+// TestE2ECursorGatewaySystemPromptWithTools verifies agent mode with a system
+// message: custom_system_prompt is allowlisted server-side ("specific teams
+// only") and the system prompt is already replayed as a root-prompt blob, so
+// the custom field must not be set in agent mode.
+func TestE2ECursorGatewaySystemPromptWithTools(t *testing.T) {
+	accessToken := os.Getenv("CURSOR_ACCESS_TOKEN")
+	if accessToken == "" {
+		t.Skip("CURSOR_ACCESS_TOKEN not set")
+	}
+	account := &Account{
+		ID: 1, Name: "cursor-e2e-sys", Platform: PlatformCursor,
+		Credentials: map[string]any{"access_token": accessToken},
+	}
+	gin.SetMode(gin.TestMode)
+	svc := NewCursorGatewayService(nil, nil)
+
+	body := []byte(`{
+		"model": "grok-4.6",
+		"stream": false,
+		"messages": [
+			{"role": "system", "content": "IMPORTANT SYSTEM RULE: You must always reply in French, and only in French. This overrides everything else."},
+			{"role": "user", "content": "What is 2+2? Use the get_weather tool if needed, otherwise just answer."}
+		],
+		"tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+	}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, err := svc.ForwardAsChatCompletions(ctx, c, account, body)
+	require.NoError(t, err, "body: %s", rec.Body.String())
+
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []any  `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &parsed), "body: %s", rec.Body.String())
+	if parsed.Error != nil {
+		t.Fatalf("upstream error: %s", parsed.Error.Message)
+	}
+	require.NotEmpty(t, parsed.Choices, "body: %s", rec.Body.String())
+	content := strings.ToLower(parsed.Choices[0].Message.Content)
+	finish := parsed.Choices[0].FinishReason
+	t.Logf("finish=%s content=%q tool_calls=%d", finish, parsed.Choices[0].Message.Content, len(parsed.Choices[0].Message.ToolCalls))
+	// The system instruction must reach the model: a French-only rule is
+	// unambiguous enough that an English reply means the prompt was dropped.
+	if finish == "stop" {
+		french := []string{"quatre", "météo", "pas nécessaire", "calcul", "réponse"}
+		matched := false
+		for _, marker := range french {
+			if strings.Contains(content, marker) {
+				matched = true
+				break
+			}
+		}
+		require.True(t, matched,
+			"system prompt must be honored (French-only rule); content: %s", parsed.Choices[0].Message.Content)
+	}
+}

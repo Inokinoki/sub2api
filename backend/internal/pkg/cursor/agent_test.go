@@ -112,7 +112,7 @@ func TestDecodeProtoJSONValueDegradesToString(t *testing.T) {
 // TestEncodeRequestContextReplyGoldenFrame verifies the reply envelope:
 // AgentClientMessage{exec_client_message=2{..., request_context_result=10}}.
 func TestEncodeRequestContextReplyGoldenFrame(t *testing.T) {
-	encoded := EncodeRequestContextReply(7, "guid-1", []AgentTool{{
+	encoded := EncodeRequestContextReply(7, "guid-1", "be terse", []AgentTool{{
 		Name:        "ping",
 		Description: "reply pong",
 		InputSchema: json.RawMessage(`{"type":"object"}`),
@@ -145,11 +145,22 @@ func TestEncodeRequestContextReplyGoldenFrame(t *testing.T) {
 			ctxMsg, err := ctx.Next()
 			require.NoError(t, err)
 			require.Equal(t, uint32(1), ctxMsg.Num)
-			tools := NewProtobufReader(ctxMsg.Data)
-			tool, err := tools.Next()
-			require.NoError(t, err)
-			require.Equal(t, uint32(fieldRequestContextTools), tool.Num)
-			require.Contains(t, string(tool.Data), "ping")
+			// The system prompt rides as a global user rule alongside tools.
+			require.Contains(t, string(ctxMsg.Data), "be terse")
+			require.Contains(t, string(ctxMsg.Data), "/sub2api/system-prompt/0.mdc")
+			fields := map[uint32]bool{}
+			cr := NewProtobufReader(ctxMsg.Data)
+			for {
+				cf, err := cr.Next()
+				if cf == nil || err != nil {
+					break
+				}
+				if cf.WireType == WireBytes {
+					fields[cf.Num] = true
+				}
+			}
+			require.True(t, fields[fieldRequestContextRules])
+			require.True(t, fields[fieldRequestContextTools])
 		}
 	}
 	require.True(t, foundResult)
@@ -484,8 +495,9 @@ func TestBuildAgentRunMessageAgentMode(t *testing.T) {
 	require.Contains(t, string(tools), "get_weather")
 	require.Contains(t, string(tools), AgentToolProviderIdentifier)
 
-	// System prompt hoisted to the custom system field.
-	require.Contains(t, string(runMsg), "be terse")
+	// The system prompt never rides the (server-rejected) custom_system field;
+	// it lives in the root-prompt blobs on the conversation state.
+	require.Contains(t, string(runMsg), "/sub2api/system-prompt/0.mdc")
 	// Action user message present.
 	require.Contains(t, string(runMsg), "weather?")
 }

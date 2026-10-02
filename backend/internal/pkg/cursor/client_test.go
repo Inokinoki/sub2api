@@ -126,7 +126,7 @@ func newTestReadCloser(tools []AgentTool, upstream []byte) (*nalReadCloser, *cap
 			src:       bytes.NewReader(upstream),
 			writer:    captured,
 			blobs:     make(map[string][]byte),
-			responder: newExecResponder(tools),
+			responder: newExecResponder(tools, ""),
 		},
 		captured
 }

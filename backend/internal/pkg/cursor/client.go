@@ -366,7 +366,7 @@ func (c *Client) streamAgentRun(ctx context.Context, host string, frame []byte, 
 		writer:    lw,
 		stopHB:    stopHB,
 		blobs:     blobs,
-		responder: newExecResponder(req.Tools),
+		responder: newExecResponder(req.Tools, systemPromptForRequest(req)),
 	}
 	return resp, nil
 }
@@ -473,11 +473,12 @@ func (n *nalReadCloser) handleServerFrame(payload []byte) bool {
 }
 
 type execResponder struct {
-	tools    []AgentTool
-	declared map[string]struct{}
+	tools        []AgentTool
+	systemPrompt string
+	declared     map[string]struct{}
 }
 
-func newExecResponder(tools []AgentTool) *execResponder {
+func newExecResponder(tools []AgentTool, systemPrompt string) *execResponder {
 	if len(tools) == 0 {
 		return nil
 	}
@@ -485,7 +486,7 @@ func newExecResponder(tools []AgentTool) *execResponder {
 	for _, tool := range tools {
 		declared[strings.ToLower(tool.Name)] = struct{}{}
 	}
-	return &execResponder{tools: tools, declared: declared}
+	return &execResponder{tools: tools, systemPrompt: systemPrompt, declared: declared}
 }
 
 // handle answers exec and interaction-query frames. Declared MCP tool calls
@@ -505,7 +506,7 @@ func (r *execResponder) handle(payload []byte, writeReply func([]byte)) bool {
 		passthrough := false
 		switch frame.Kind {
 		case execKindRequestContext:
-			reply = EncodeRequestContextReply(frame.ID, frame.ExecID, r.tools)
+			reply = EncodeRequestContextReply(frame.ID, frame.ExecID, r.systemPrompt, r.tools)
 		case execKindMcpState:
 			reply = EncodeMcpStateReply(frame.ID, frame.ExecID, r.tools, frame.ServerIDs)
 		case execKindMcpCall:
@@ -563,14 +564,18 @@ func (n *nalReadCloser) handleKV(payload []byte) bool {
 	var reply []byte
 	switch {
 	case len(op.setBlob) > 0:
+		cursorDebugFrame("kv set id=%d len=%d", op.id, len(op.setData))
 		n.blobs[string(op.setBlob)] = append([]byte(nil), op.setData...)
 		reply = encodeKVSetResult(op.id)
 	case len(op.getBlob) > 0:
+		found := false
 		if data, ok := n.blobs[string(op.getBlob)]; ok {
+			found = true
 			reply = encodeKVGetResult(op.id, data, "")
 		} else {
 			reply = encodeKVGetResult(op.id, nil, "blob not found")
 		}
+		cursorDebugFrame("kv get id=%d found=%v", op.id, found)
 	default:
 		return true
 	}
@@ -625,4 +630,11 @@ func cursorDebugFrame(format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[cursor-frame] "+format+"\n", args...)
+}
+
+// systemPromptForRequest extracts the hoisted system message for the
+// request-context rule.
+func systemPromptForRequest(req AgentRunRequest) string {
+	systemPrompt, _, _ := splitAskMessages(req.Messages)
+	return systemPrompt
 }
