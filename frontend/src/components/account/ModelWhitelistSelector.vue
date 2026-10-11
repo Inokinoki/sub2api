@@ -104,7 +104,7 @@
       <button
         v-if="canSyncUpstream"
         type="button"
-        @click="syncUpstreamModels"
+        @click="syncUpstreamModels()"
         :disabled="isSyncingUpstream"
         class="rounded-lg border border-emerald-200 px-3 py-1.5 text-sm text-emerald-600 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-emerald-800 dark:text-emerald-400 dark:hover:bg-emerald-900/30"
       >
@@ -145,7 +145,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { accountsAPI } from '@/api/admin/accounts'
@@ -154,6 +154,7 @@ import { useClipboard } from '@/composables/useClipboard'
 import ModelIcon from '@/components/common/ModelIcon.vue'
 import Icon from '@/components/icons/Icon.vue'
 import { allModels, getModelsByPlatform } from '@/composables/useModelWhitelist'
+import { supportsUpstreamModelSync } from '@/constants/platformCatalog'
 
 const { t } = useI18n()
 
@@ -177,8 +178,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   'update:modelValue': [value: string[]]
-  'catalog-loaded': [models: string[]]
   'upstream-synced': []
+  'catalog-loaded': [models: string[]]
 }>()
 
 const appStore = useAppStore()
@@ -189,7 +190,6 @@ const searchQuery = ref('')
 const customModel = ref('')
 const isComposing = ref(false)
 const isSyncingUpstream = ref(false)
-const liveCatalog = ref<string[]>([])
 const normalizedPlatforms = computed(() => {
   const rawPlatforms =
     props.platforms && props.platforms.length > 0
@@ -207,33 +207,34 @@ const normalizedPlatforms = computed(() => {
   )
 })
 
-const upstreamSyncPlatforms = new Set([
-  'anthropic',
-  'openai',
-  'gemini',
-  'antigravity',
-  'grok',
-  'cursor',
-  'kimi',
-  'zhipu',
-  'deepseek',
-  'minimax',
-  'opencode_go'
-])
 const canSyncUpstream = computed(() => {
   if (props.accountId) {
     if (normalizedPlatforms.value.length === 0) return true
-    return normalizedPlatforms.value.some(platform => upstreamSyncPlatforms.has(platform.toLowerCase()))
+    return normalizedPlatforms.value.some(supportsUpstreamModelSync)
   }
   if (props.syncCredentials) {
-    return upstreamSyncPlatforms.has(props.syncCredentials.platform.toLowerCase())
+    return supportsUpstreamModelSync(props.syncCredentials.platform)
   }
   return false
 })
 
-const staticPlatformModels = computed(() => {
+// Live picker catalog (cursor): when present it replaces the static list in
+// the dropdown; existing selections stay visible.
+const liveModelCatalog = ref<string[]>([])
+
+const availableOptions = computed(() => {
+  if (liveModelCatalog.value.length > 0) {
+    const seen = new Set(props.modelValue)
+    const options = liveModelCatalog.value
+      .filter(model => !seen.has(model))
+      .map(model => ({ value: model, label: model }))
+    for (const model of props.modelValue) {
+      options.unshift({ value: model, label: model })
+    }
+    return options
+  }
   if (normalizedPlatforms.value.length === 0) {
-    return allModels.map(model => model.value)
+    return allModels
   }
 
   const allowedModels = new Set<string>()
@@ -242,23 +243,8 @@ const staticPlatformModels = computed(() => {
       allowedModels.add(model)
     }
   }
-  return Array.from(allowedModels)
-})
 
-const availableOptions = computed(() => {
-  const seen = new Set<string>()
-  const options: { value: string; label: string }[] = []
-  const add = (model: string) => {
-    const id = model.trim()
-    if (!id || seen.has(id)) return
-    seen.add(id)
-    options.push({ value: id, label: id })
-  }
-
-  for (const model of liveCatalog.value) add(model)
-  for (const model of staticPlatformModels.value) add(model)
-  for (const model of props.modelValue) add(model)
-  return options
+  return allModels.filter(model => allowedModels.has(model.value))
 })
 
 const filteredModels = computed(() => {
@@ -310,95 +296,61 @@ const handleEnter = () => {
   if (!isComposing.value) addCustom()
 }
 
-const fillRelated = async () => {
-  let sources = liveCatalog.value
-  let usedStaticFallback = false
-  if (sources.length === 0) {
-    if (canLoadCatalog()) {
-      try {
-        const result = await fetchUpstreamModels()
-        const upstreamModels = result?.models.map(model => model.trim()).filter(Boolean) ?? []
-        if (upstreamModels.length > 0) {
-          applyLiveCatalog(upstreamModels)
-          sources = upstreamModels
-        }
-      } catch {
-        // Live picker failed; fall through to the static catalog.
+const fillRelated = () => {
+  const newModels = [...props.modelValue]
+  const usedStaticCursor =
+    liveModelCatalog.value.length === 0 &&
+    normalizedPlatforms.value.some(platform => platform === 'cursor')
+  for (const platform of normalizedPlatforms.value) {
+    for (const model of getModelsByPlatform(platform)) {
+      if (!newModels.includes(model)) {
+        newModels.push(model)
       }
     }
-    if (sources.length === 0) {
-      sources = staticPlatformModels.value
-      usedStaticFallback = sources.length > 0
-    }
   }
-
-  const newModels = [...props.modelValue]
-  for (const model of sources) {
-    if (!newModels.includes(model)) {
-      newModels.push(model)
-    }
+  if (usedStaticCursor) {
+    appStore.showWarning(t('admin.accounts.cursorStaticFallbackUsed'))
   }
   emit('update:modelValue', newModels)
-  if (usedStaticFallback && normalizedPlatforms.value.some(platform => platform.toLowerCase() === 'cursor')) {
-    appStore.showWarning(t('admin.accounts.cursorStaticFallbackUsed', { count: sources.length }))
-  }
 }
 
-const applyLiveCatalog = (models: string[]) => {
-  liveCatalog.value = models
-  emit('catalog-loaded', models)
-}
-
-const canLoadCatalog = () => {
-  if (!canSyncUpstream.value) return false
-  if (props.accountId) return true
-  const creds = props.syncCredentials
-  if (!creds) return false
-  if (creds.platform.toLowerCase() === 'cursor') {
-    return Boolean(creds.access_token?.trim())
+// Cursor groups auto-load the live picker (falls back to the bundled
+// snapshot when unreachable); other platforms keep the manual sync button.
+onMounted(() => {
+  if (normalizedPlatforms.value.some(platform => platform === 'cursor')) {
+    void syncUpstreamModels({ silent: true })
   }
-  return Boolean(creds.api_key?.trim())
-}
+})
 
-const fetchUpstreamModels = async () => {
-  if (props.accountId) {
-    return accountsAPI.syncUpstreamModels(props.accountId)
-  }
-  if (props.syncCredentials) {
-    return accountsAPI.syncUpstreamModelsPreview(props.syncCredentials as SyncUpstreamPreviewParams)
-  }
-  return null
-}
+const syncUpstreamModels = async (options?: { silent?: boolean }) => {
+  if (isSyncingUpstream.value || !canSyncUpstream.value) return
 
-const loadLiveCatalog = async () => {
-  if (!canLoadCatalog()) return
-  try {
-    const result = await fetchUpstreamModels()
-    const upstreamModels = result?.models.map(model => model.trim()).filter(Boolean) ?? []
-    if (upstreamModels.length > 0) {
-      applyLiveCatalog(upstreamModels)
-    }
-  } catch {
-    // Auto-load keeps the static fallback when the live picker is unreachable.
-  }
-}
-
-const syncUpstreamModels = async () => {
-  if (isSyncingUpstream.value) return
-  if (!canLoadCatalog()) return
-
+  // Auto-loads stay quiet: the static fallback notice is the only feedback.
+  const silent = options?.silent ?? false
   isSyncingUpstream.value = true
   try {
-    const result = await fetchUpstreamModels()
-    if (!result) return
-
-    const upstreamModels = result.models.map(model => model.trim()).filter(Boolean)
-    if (upstreamModels.length === 0) {
-      appStore.showInfo(t('admin.accounts.syncUpstreamModelsEmpty'))
+    let result
+    if (props.accountId) {
+      result = await accountsAPI.syncUpstreamModels(props.accountId)
+    } else if (props.syncCredentials) {
+      result = await accountsAPI.syncUpstreamModelsPreview(props.syncCredentials as SyncUpstreamPreviewParams)
+    } else {
       return
     }
 
-    applyLiveCatalog(upstreamModels)
+    const upstreamModels = result.models.map(model => model.trim()).filter(Boolean)
+    if (upstreamModels.length === 0) {
+      if (!silent) appStore.showInfo(t('admin.accounts.syncUpstreamModelsEmpty'))
+      return
+    }
+
+    emit('catalog-loaded', upstreamModels)
+    if (silent) {
+      // Auto-load: populate the dropdown only; the caller reads the catalog
+      // via catalog-loaded and the static fallback stays as-is on failure.
+      liveModelCatalog.value = upstreamModels
+      return
+    }
     if (!props.accountId) {
       emit('upstream-synced')
     }
@@ -421,11 +373,11 @@ const syncUpstreamModels = async () => {
       warning => warning.code === 'upstream_model_metadata_incomplete'
     )
     if (hasIncompleteMetadata) {
-      appStore.showWarning(t('admin.accounts.syncUpstreamModelsMetadataIncomplete'))
+      if (!silent) appStore.showWarning(t('admin.accounts.syncUpstreamModelsMetadataIncomplete'))
       return
     }
     if (addedCount > 0) {
-      appStore.showSuccess(t('admin.accounts.syncUpstreamModelsSuccess', { count: addedCount, total: upstreamModels.length }))
+      if (!silent) appStore.showSuccess(t('admin.accounts.syncUpstreamModelsSuccess', { count: addedCount, total: upstreamModels.length }))
     } else {
       appStore.showInfo(t('admin.accounts.syncUpstreamModelsNoChanges', { count: upstreamModels.length }))
     }
@@ -433,8 +385,13 @@ const syncUpstreamModels = async () => {
       appStore.showWarning(t('admin.accounts.syncUpstreamModelsMetadataPartial'))
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : t('admin.accounts.syncUpstreamModelsFailed')
-    appStore.showError(t('admin.accounts.syncUpstreamModelsError', { message }))
+    if (silent && normalizedPlatforms.value.some(platform => platform === 'cursor')) {
+      // Auto-load fell back to the bundled snapshot; surface that once.
+      appStore.showWarning(t('admin.accounts.cursorStaticFallbackUsed'))
+    } else {
+      const message = error instanceof Error ? error.message : t('admin.accounts.syncUpstreamModelsFailed')
+      appStore.showError(t('admin.accounts.syncUpstreamModelsError', { message }))
+    }
   } finally {
     isSyncingUpstream.value = false
   }
@@ -444,31 +401,4 @@ const clearAll = () => {
   emit('update:modelValue', [])
 }
 
-let catalogTimer: ReturnType<typeof setTimeout> | undefined
-watch(
-  () => ({
-    accountId: props.accountId,
-    platform: props.platform,
-    platforms: props.platforms?.join(','),
-    accessToken: props.syncCredentials?.access_token,
-    apiKey: props.syncCredentials?.api_key
-  }),
-  () => {
-    if (catalogTimer) clearTimeout(catalogTimer)
-    if (props.accountId) {
-      void loadLiveCatalog()
-      return
-    }
-    catalogTimer = setTimeout(() => {
-      void loadLiveCatalog()
-    }, 400)
-  },
-  { immediate: true }
-)
-
-onBeforeUnmount(() => {
-  if (catalogTimer) clearTimeout(catalogTimer)
-})
-
 </script>
-
